@@ -10,9 +10,9 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app.config import data_root
-from app import docker_cli
-from app.images import build_args, missing_sources, recipes
+from app.config import data_root, repo_root
+from app import docker_cli, git_cli
+from app.images import build_args, recipes
 from app.runtimes import BASE_IMAGE, known_images, user_context
 from app.storage import now_iso
 
@@ -72,12 +72,57 @@ def _append(job_id: str, line: str, status: str | None = None) -> None:
         _write(job)
 
 
+def _has_code(path: Path) -> bool:
+    return path.is_dir() and any(path.iterdir())
+
+
+def _clone_destination_ok(path: Path) -> bool:
+    root = repo_root().resolve()
+    try:
+        relative = path.resolve().relative_to(root)
+    except ValueError:
+        return True
+    return bool(relative.parts) and relative.parts[0] == "tmp"
+
+
+def _prepare_sources(job_id: str, recipe) -> int:
+    for name, path in recipe.required.items():
+        if _has_code(path):
+            _append(job_id, f"{name} 的模型代码已在 {path}")
+            continue
+        url = recipe.clones.get(name, "")
+        if not url:
+            _append(job_id, f"找不到{name}的模型代码：{path}")
+            _append(job_id, "构建停止")
+            return 1
+        if path.exists() and not path.is_dir():
+            _append(job_id, f"找不到{name}的模型代码：{path}")
+            _append(job_id, "构建停止")
+            return 1
+        if not _clone_destination_ok(path):
+            _append(job_id, f"不能把 {name} clone 进交付台源码目录：{path}")
+            _append(job_id, "构建停止")
+            return 1
+        _append(job_id, f"正在 clone {url} 到 {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            code, output = git_cli.run(["clone", "--depth", "1", url, str(path)])
+        except RuntimeError as exc:
+            _append(job_id, str(exc))
+            _append(job_id, "构建停止")
+            return 1
+        if output:
+            for line in output.splitlines():
+                _append(job_id, line)
+        if code != 0 or not _has_code(path):
+            _append(job_id, "clone 失败")
+            _append(job_id, "构建停止")
+            return 1
+    return 0
+
+
 def _run_build(job_id: str, recipe) -> int:
-    missing = missing_sources(recipe)
-    if missing:
-        for line in missing:
-            _append(job_id, line)
-        _append(job_id, "构建停止")
+    if _prepare_sources(job_id, recipe) != 0:
         return 1
     code, output = docker_cli.run(build_args(recipe))
     if output:

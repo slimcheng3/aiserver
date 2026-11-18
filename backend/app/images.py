@@ -1,4 +1,4 @@
-"""内置镜像怎么构建。模型代码目录不在交付台仓库里。"""
+"""内置镜像怎么构建。克隆下来的模型代码放在仓库根目录的 tmp，不提交。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from pathlib import Path
 from app.config import repo_root
 
 
+SAM3_GIT = "https://github.com/facebookresearch/sam3.git"
+
+
 @dataclass(frozen=True)
 class ImageRecipe:
     image: str
@@ -16,26 +19,38 @@ class ImageRecipe:
     context: Path
     contexts: dict[str, Path]
     required: dict[str, Path]
+    clones: dict[str, str]
 
 
 def _src(env_name: str, default: str) -> Path:
     return Path(os.environ.get(env_name, default))
 
 
+def _url(env_name: str, default: str) -> str:
+    return os.environ.get(env_name, default).strip()
+
+
 def recipes() -> dict[str, ImageRecipe]:
     root = repo_root()
     common = root / "engines" / "common"
-    sam3 = _src("AISERVER_SAM3_SRC", r"D:\playgound\sam3")
+    sam3 = _src("AISERVER_SAM3_SRC", str(root / "tmp" / "sam3"))
     genpose2 = _src("AISERVER_GENPOSE2_SRC", r"D:\playgound\genpose2")
     flashrt = _src("AISERVER_FLASHRT_SRC", r"D:\playgound\flashrt")
 
-    def recipe(image: str, folder: str, contexts: dict[str, Path], required: dict[str, Path]) -> ImageRecipe:
+    def recipe(
+        image: str,
+        folder: str,
+        contexts: dict[str, Path],
+        required: dict[str, Path],
+        clones: dict[str, str] | None = None,
+    ) -> ImageRecipe:
         return ImageRecipe(
             image=image,
             dockerfile=root / "engines" / folder / "Dockerfile",
             context=root / "engines" / folder,
             contexts=contexts,
             required=required,
+            clones=clones or {},
         )
 
     items = [
@@ -45,6 +60,7 @@ def recipes() -> dict[str, ImageRecipe]:
             "sam3",
             {"common": common, "sam3": sam3},
             {"sam3": sam3},
+            {"sam3": _url("AISERVER_SAM3_URL", SAM3_GIT)},
         ),
         recipe(
             "local/genpose2-engine:latest",
@@ -70,10 +86,3 @@ def build_args(recipe: ImageRecipe) -> list[str]:
     args.append(str(recipe.context))
     return args
 
-
-def missing_sources(recipe: ImageRecipe) -> list[str]:
-    missing = []
-    for name, path in recipe.required.items():
-        if not path.exists():
-            missing.append(f"找不到{name}的模型代码：{path}")
-    return missing

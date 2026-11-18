@@ -80,6 +80,11 @@ export function BuildPage({ modelId, image }: { modelId: string | null; image: s
       <p className="page-lead">
         构建 {target || "这张镜像"}。本机已经有它时会直接跳过。拉基础镜像和安装依赖会比较久，这一步在后台跑，装配页不会触发它。
       </p>
+      {target === "local/sam3-engine:latest" && (
+        <p className="hint">
+          本机还没有 SAM 3 模型代码时，会先从 https://github.com/facebookresearch/sam3 clone 到项目根目录的 tmp/sam3，已有则跳过。权重不在这次 clone 里。
+        </p>
+      )}
       {error && <p className="error">{error}</p>}
       <FlowSteps active={status === "ready" ? 2 : 1} />
       <section className="section">

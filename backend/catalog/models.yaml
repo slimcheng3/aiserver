@@ -1,0 +1,135 @@
+# 模型目录。镜像名、启动命令、服务代码位置按你已有的引擎改。
+# 保存后刷新页面即可，不用重启。生成模型包时会把当时的值抄进 manifest，
+# 之后再改这里，不会影响已经生成的包。
+# engine.models 是这份运行时能加载的模型。weightQuants 是它能读的权重精度。
+# 装配时每份权重要标 quant，并且必须落在对应运行时的 weightQuants 里。
+models:
+  - id: sam3
+    displayName: SAM 3
+    vendor: Meta
+    task: 开放词汇分割
+    tone: green
+    summary: 用文本概念在图像和视频里分割、跟踪对象。权重一般是单个 checkpoint，具体文件名由你的服务代码决定。
+    interfaces:
+      inputs: [image, video, text]
+      outputs: [mask]
+    engine:
+      image: local/sam3-engine:latest
+      codeRef: engines/sam3
+      command: ["python", "serve.py"]
+      port: 8080
+      healthPath: /health
+      protocol: http
+      models: [sam3]
+      weightQuants: [fp16, bf16]
+    resources:
+      gpu: 1
+      gpuMemoryGi: 24
+      cpu: 4
+      memoryGi: 32
+    env: {}
+    artifacts:
+      - role: checkpoint
+        label: 分割权重
+        required: true
+        prefer: file
+        hint: sam3 的 checkpoint，pt 或 safetensors 都可以
+
+  - id: genpose2
+    displayName: GenPose2
+    vendor: GenPose
+    task: 类别级 6D 位姿
+    tone: blue
+    summary: 从观测估计物体的 6D 位姿。服务代码负责解释权重；如果某类物体还要 CAD 或先验，可以一并绑进包里。
+    interfaces:
+      inputs: [image, depth]
+      outputs: [pose]
+    engine:
+      image: local/genpose2-engine:latest
+      codeRef: engines/genpose2
+      command: ["python", "serve.py"]
+      port: 8081
+      healthPath: /health
+      protocol: http
+      models: [genpose2]
+      weightQuants: [fp16, bf16]
+    resources:
+      gpu: 1
+      gpuMemoryGi: 16
+      cpu: 4
+      memoryGi: 24
+    env: {}
+    artifacts:
+      - role: checkpoint
+        label: 位姿权重
+        required: true
+        prefer: file
+        hint: GenPose2 主权重
+      - role: cad
+        label: CAD / 先验
+        required: false
+        prefer: any
+        hint: 可选。一类物体一个文件或一个目录
+        quantized: false
+
+  - id: pi05
+    displayName: π0.5
+    vendor: Physical Intelligence
+    task: 视觉-语言-动作
+    tone: amber
+    summary: 把图像、语言和本体状态映射成机器人动作。权重大多是一个 checkpoint 目录，归一化统计通常就在目录里。服务常见是长连接，不一定是 REST。
+    interfaces:
+      inputs: [image, text, proprio]
+      outputs: [action]
+    engine:
+      image: local/flashrt-engine:latest
+      codeRef: engines/flashrt
+      command: ["python", "serve.py"]
+      port: 8000
+      healthPath: /health
+      protocol: websocket
+      models: [pi05]
+      weightQuants: [fp16, bf16]
+    resources:
+      gpu: 1
+      gpuMemoryGi: 24
+      cpu: 8
+      memoryGi: 64
+    env: {}
+    artifacts:
+      - role: checkpoint
+        label: 策略权重
+        required: true
+        prefer: directory
+        hint: checkpoint 目录，或服务能够直接加载的单文件
+
+  - id: qwen
+    displayName: Qwen
+    vendor: Alibaba
+    task: 语言 / 视觉语言
+    tone: ink
+    summary: 通义千问。是纯文本还是视觉语言，由你的引擎镜像和权重决定。权重按模型目录组织，里面包含配置、分片和 tokenizer。
+    interfaces:
+      inputs: [text, image]
+      outputs: [text]
+    engine:
+      image: local/vllm-engine:latest
+      codeRef: engines/vllm
+      command: ["python", "serve.py"]
+      port: 8082
+      healthPath: /health
+      protocol: http
+      models: [qwen]
+      weightQuants: [fp16, bf16, awq, gptq, fp8]
+    resources:
+      gpu: 1
+      gpuMemoryGi: 24
+      cpu: 8
+      memoryGi: 48
+    env: {}
+    artifacts:
+      - role: model_dir
+        label: 模型目录
+        required: true
+        prefer: directory
+        hint: Hugging Face 布局的目录。服务如果只认单文件，也可以绑一个文件

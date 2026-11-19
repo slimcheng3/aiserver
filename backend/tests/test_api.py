@@ -312,7 +312,7 @@ def test_user_runtime_then_package(tmp_path: Path, monkeypatch) -> None:
 
 def test_build_skips_when_image_exists_and_stops_without_source(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
-    monkeypatch.setenv("AISERVER_SAM3_SRC", str(tmp_path / "no-sam3"))
+    monkeypatch.setenv("AISERVER_GENPOSE2_SRC", str(tmp_path / "no-genpose2"))
     client = client_with(tmp_path, monkeypatch)
 
     def present(args, cwd=None):
@@ -331,31 +331,22 @@ def test_build_skips_when_image_exists_and_stops_without_source(tmp_path: Path, 
             return 1, "absent"
         raise AssertionError(args)
 
-    def no_clone(args, cwd=None):
-        return 1, "clone 没有连上"
-
     monkeypatch.setattr("app.docker_cli.run", missing)
-    monkeypatch.setattr("app.git_cli.run", no_clone)
-    failed = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
+    failed = client.post("/api/builds", json={"image": "local/genpose2-engine:latest"})
     assert failed.status_code == 200
     assert failed.json()["status"] == "failed"
-    assert any("正在 clone https://github.com/facebookresearch/sam3.git" in line for line in failed.json()["logs"])
-    assert any("clone 失败" in line for line in failed.json()["logs"])
+    assert any("找不到genpose2的模型代码" in line for line in failed.json()["logs"])
 
 
-def test_sam3_build_clones_missing_source_then_skips(tmp_path: Path, monkeypatch) -> None:
-    dest = tmp_path / "sam3"
+def test_sam3_build_uses_code_in_the_repo(tmp_path: Path, monkeypatch) -> None:
+    from app.config import repo_root
+
     monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
-    monkeypatch.setenv("AISERVER_SAM3_SRC", str(dest))
     client = client_with(tmp_path, monkeypatch)
-    clones: list[list[str]] = []
     builds: list[list[str]] = []
 
     def git_run(args, cwd=None):
-        clones.append(list(args))
-        dest.mkdir(parents=True)
-        (dest / "pyproject.toml").write_text("[project]\nname = 'sam3'\n", encoding="utf-8")
-        return 0, "cloned"
+        raise AssertionError(args)
 
     def docker_run(args, cwd=None):
         if args[:2] == ["image", "inspect"]:
@@ -367,86 +358,12 @@ def test_sam3_build_clones_missing_source_then_skips(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("app.git_cli.run", git_run)
     monkeypatch.setattr("app.docker_cli.run", docker_run)
-    first = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
-    assert first.status_code == 200
-    assert first.json()["status"] == "ready"
-    assert clones == [["clone", "--depth", "1", "https://github.com/facebookresearch/sam3.git", str(dest)]]
-    assert any(arg == f"sam3={dest}" for arg in builds[0])
-
-    second = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
-    assert second.status_code == 200
-    assert second.json()["status"] == "ready"
-    assert len(clones) == 1
-    assert any("模型代码已在" in line for line in second.json()["logs"])
-
-
-def test_sam3_clone_defaults_to_project_tmp(tmp_path: Path, monkeypatch) -> None:
-    from app.config import repo_root
-    from app.images import recipes
-
-    monkeypatch.delenv("AISERVER_SAM3_SRC", raising=False)
-    dest = repo_root() / "tmp" / "sam3"
-    assert recipes()["local/sam3-engine:latest"].required["sam3"] == dest
-
-    scratch = repo_root() / "tmp" / "_pytest_sam3"
-    monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
-    monkeypatch.setenv("AISERVER_SAM3_SRC", str(scratch))
-    client = client_with(tmp_path, monkeypatch)
-    clones: list[list[str]] = []
-
-    def git_run(args, cwd=None):
-        clones.append(list(args))
-        scratch.mkdir(parents=True)
-        (scratch / "pyproject.toml").write_text("[project]\nname = 'sam3'\n", encoding="utf-8")
-        return 0, "cloned"
-
-    def docker_run(args, cwd=None):
-        if args[:2] == ["image", "inspect"]:
-            return 1, "absent"
-        if args and args[0] == "build":
-            return 0, "built"
-        raise AssertionError(args)
-
-    monkeypatch.setattr("app.git_cli.run", git_run)
-    monkeypatch.setattr("app.docker_cli.run", docker_run)
-    try:
-        job = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
-        assert job.status_code == 200
-        assert job.json()["status"] == "ready"
-        assert clones == [["clone", "--depth", "1", "https://github.com/facebookresearch/sam3.git", str(scratch)]]
-    finally:
-        if scratch.exists():
-            for child in scratch.iterdir():
-                child.unlink()
-            scratch.rmdir()
-        parent = scratch.parent
-        if parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
-
-
-def test_sam3_clone_refuses_the_source_tree(tmp_path: Path, monkeypatch) -> None:
-    from app.config import repo_root
-
-    dest = repo_root() / "engines" / "sam3" / "_pytest_clone"
-    monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
-    monkeypatch.setenv("AISERVER_SAM3_SRC", str(dest))
-    client = client_with(tmp_path, monkeypatch)
-
-    def docker_run(args, cwd=None):
-        if args[:2] == ["image", "inspect"]:
-            return 1, "absent"
-        raise AssertionError(args)
-
-    def git_run(args, cwd=None):
-        raise AssertionError(args)
-
-    monkeypatch.setattr("app.docker_cli.run", docker_run)
-    monkeypatch.setattr("app.git_cli.run", git_run)
-    failed = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
-    assert failed.status_code == 200
-    assert failed.json()["status"] == "failed"
-    assert any("不能把 sam3 clone 进交付台源码目录" in line for line in failed.json()["logs"])
-    assert not dest.exists()
+    job = client.post("/api/builds", json={"image": "local/sam3-engine:latest"})
+    assert job.status_code == 200
+    assert job.json()["status"] == "ready"
+    assert builds
+    assert not any(arg.startswith("sam3=") for arg in builds[0])
+    assert (repo_root() / "engines" / "sam3" / "upstream" / "sam3" / "model_builder.py").is_file()
 
 
 def test_user_runtime_build_builds_base_image_first(tmp_path: Path, monkeypatch) -> None:

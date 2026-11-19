@@ -6,7 +6,7 @@ import type { EnvironmentInfo, ModelDef, QuantType, RuntimeInfo } from "../types
 const QUANTS: QuantType[] = ["fp16", "bf16", "int8", "awq", "gptq", "fp8"];
 
 const NOTE: Record<string, string> = {
-  "local/sam3-engine:latest": "第一次构建时，本机还没有模型代码就会从 https://github.com/facebookresearch/sam3 clone 到项目根目录的 tmp/sam3。服务代码在 engines/sam3。",
+  "local/sam3-engine:latest": "推理代码在 engines/sam3/upstream，服务入口在 engines/sam3。权重不进镜像。",
   "local/genpose2-engine:latest": "模型代码在 D:\\playgound\\genpose2，服务代码在 engines/genpose2。",
   "local/vllm-engine:latest": "推理代码在 vLLM 镜像里。权重是带配置和 tokenizer 的模型目录。",
   "local/flashrt-engine:latest": "用 FlashRT 部署 π0.5。计算核来自本机 FlashRT 目录，不通过 requirements.txt 安装。",

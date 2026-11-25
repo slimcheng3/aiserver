@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import json
+import queue
+import threading
+import zipfile
+from collections.abc import Iterator
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -12,7 +18,14 @@ from app.config import catalog_path, data_root, repo_root
 from app.deploys import call_chat, call_infer, deploy, list_deploys, probe, stop
 from app.environment import environment
 from app.packaging import create_package, delete_package, get_package, list_packages
-from app.runtimes import create_user_runtime, delete_base, known_images, list_runtimes, register_base
+from app.runtimes import (
+    create_user_runtime,
+    delete_base,
+    known_images,
+    list_runtimes,
+    register_base,
+    runtime_document,
+)
 from app.schemas import (
     BaseCreate,
     BuildRequest,
@@ -187,9 +200,60 @@ def remove_base(image: str) -> dict[str, bool]:
     return {"ok": True}
 
 
-def _tar_filename(image: str) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in image)
-    return f"{safe}.tar"
+def _download_stem(image: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in image)
+
+
+def _export_runtime(image: str) -> Iterator[bytes]:
+    """压缩包里放镜像 tar 和 runtime.json。镜像按块写入，不先收齐整包。"""
+    document = json.dumps(runtime_document(image), ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    tar_name = "runtime.tar"
+    stop = threading.Event()
+    chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
+    failed: list[BaseException] = []
+
+    class _Writer:
+        def write(self, data: bytes) -> int:
+            if stop.is_set():
+                raise RuntimeError("下载已取消")
+            chunks.put(data)
+            return len(data)
+
+        def seekable(self) -> bool:
+            return False
+
+        def flush(self) -> None:
+            return None
+
+    def produce() -> None:
+        saved = docker_cli.save(image)
+        try:
+            with zipfile.ZipFile(_Writer(), "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                archive.writestr("runtime.json", document)
+                with archive.open(tar_name, "w", force_zip64=True) as dest:
+                    for piece in saved:
+                        if stop.is_set():
+                            break
+                        dest.write(piece)
+        except Exception as exc:
+            failed.append(exc)
+        finally:
+            close = getattr(saved, "close", None)
+            if callable(close):
+                close()
+            chunks.put(None)
+
+    threading.Thread(target=produce, daemon=True).start()
+    try:
+        while True:
+            piece = chunks.get()
+            if piece is None:
+                break
+            yield piece
+    finally:
+        stop.set()
+    if failed:
+        raise failed[0]
 
 
 @app.get("/api/runtimes/tar")
@@ -203,10 +267,10 @@ def download_runtime_tar(image: str) -> StreamingResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not present:
         raise HTTPException(status_code=404, detail="镜像还没构建，不能下载")
-    filename = _tar_filename(image)
+    filename = _download_stem(image) + ".zip"
     return StreamingResponse(
-        docker_cli.save(image),
-        media_type="application/x-tar",
+        _export_runtime(image),
+        media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

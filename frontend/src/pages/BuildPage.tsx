@@ -152,7 +152,7 @@ export function BuildPage({ modelId, image }: { modelId: string | null; image: s
           ) : null}
           {imageReady && target ? (
             <a className="btn" href={`/api/runtimes/tar?image=${encodeURIComponent(target)}`}>
-              下载 tar
+              下载
             </a>
           ) : null}
           {built || imageReady ? (

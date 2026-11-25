@@ -397,5 +397,28 @@ def user_base_image(folder: Path) -> str:
     return BASE_IMAGE
 
 
+def runtime_document(image: str) -> dict:
+    for runtime in list_runtimes():
+        if runtime["image"] != image:
+            continue
+        return {
+            "apiVersion": "aiserver.runtime/v1",
+            "id": runtime["id"],
+            "name": runtime["name"],
+            "image": runtime["image"],
+            "kind": runtime["kind"],
+            "command": list(runtime["command"]),
+            "port": runtime["port"],
+            "healthPath": runtime["healthPath"],
+            "protocol": runtime["protocol"],
+            "models": list(runtime["models"]),
+            "weightQuants": list(runtime["weightQuants"]),
+            "baseImage": runtime.get("baseImage") or "",
+            "codeRef": runtime.get("codeRef") or "",
+            "note": runtime.get("note") or "",
+        }
+    raise HTTPException(status_code=404, detail="这台机体没有这份运行时")
+
+
 def known_images() -> list[str]:
     return [runtime["image"] for runtime in list_runtimes()]

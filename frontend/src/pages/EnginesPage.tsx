@@ -46,7 +46,7 @@ export function EnginesPage() {
       <p className="page-kicker">同一台机体</p>
       <h1 className="page-title">运行时</h1>
       <p className="page-lead">
-        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。登记基础镜像时，本机没有的会从仓库拉取。镜像已经在本机时，普通构建会跳过；服务代码改过之后，用重新构建再打一次。本机已经有的运行时可以下载成 tar，另一台机器用 docker load -i 导入。权重不在这个包里。
+        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。登记基础镜像时，本机没有的会从仓库拉取。镜像已经在本机时，普通构建会跳过；服务代码改过之后，用重新构建再打一次。本机已经有的运行时可以下载成压缩包，里面是 runtime.tar 和 runtime.json。另一台机器解压后用 docker load -i runtime.tar 导入。权重不在这个包里。
       </p>
       {error && <p className="error">{error}</p>}
       {env && (
@@ -208,7 +208,7 @@ function RuntimeCard({
             ))}
           {ready && (
             <a className="btn tar-download" href={`/api/runtimes/tar?image=${encodeURIComponent(runtime.image)}`}>
-              下载 tar
+              下载
             </a>
           )}
         </div>

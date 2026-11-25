@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import socket
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -1042,10 +1045,16 @@ def test_runtime_tar_exports_a_local_image(tmp_path: Path, monkeypatch) -> None:
 
     ready = client.get("/api/runtimes/tar", params={"image": "local/flashrt-engine:latest"})
     assert ready.status_code == 200
-    assert ready.content == b"tar-bytes"
-    assert ready.headers["content-type"].startswith("application/x-tar")
-    assert 'filename="local_flashrt-engine_latest.tar"' in ready.headers["content-disposition"]
+    assert ready.headers["content-type"].startswith("application/zip")
+    assert 'filename="local_flashrt-engine_latest.zip"' in ready.headers["content-disposition"]
     assert saved == ["local/flashrt-engine:latest"]
+    bundle = zipfile.ZipFile(io.BytesIO(ready.content))
+    assert bundle.namelist() == ["runtime.json", "runtime.tar"]
+    assert bundle.read("runtime.tar") == b"tar-bytes"
+    document = json.loads(bundle.read("runtime.json"))
+    assert document["image"] == "local/flashrt-engine:latest"
+    assert document["protocol"] == "websocket"
+    assert document["models"] == ["pi05"]
 
 
 def test_reference_serve_sample_is_accepted(tmp_path: Path, monkeypatch) -> None:

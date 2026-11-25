@@ -15,7 +15,7 @@ export function PackagesPage() {
     <div className="page">
       <p className="page-kicker">可部署的装配结果</p>
       <h1 className="page-title">模型包</h1>
-      <p className="page-lead">每份模型包是一个目录，里面只有清单。参数仍留在原来的位置，部署到本机或边侧时再挂进容器。</p>
+      <p className="page-lead">每份模型包是一个目录，里面只有清单。参数仍留在原来的位置，部署时再挂进容器。</p>
       {error && <p className="error">{error}</p>}
       {packages.length === 0 ? (
         <div className="section">

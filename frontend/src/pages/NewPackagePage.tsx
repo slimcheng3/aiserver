@@ -11,11 +11,37 @@ function choicesFor(model: ModelDef, runtimes: RuntimeInfo[]): RuntimeChoice[] {
   return runtimes.filter((runtime) => runtime.kind !== "base" && runtime.models.includes(model.id));
 }
 
+const LOCKED_FLAGS = new Set(["--model", "--host", "--port"]);
+
+function splitCommand(parts: string[]): { locked: string[]; extra: string[] } {
+  const locked: string[] = [];
+  const extra: string[] = [];
+  let index = 0;
+  while (index < parts.length) {
+    const token = parts[index];
+    if (LOCKED_FLAGS.has(token)) {
+      locked.push(token);
+      index += 1;
+      if (index < parts.length && !parts[index].startsWith("-")) {
+        locked.push(parts[index]);
+        index += 1;
+      }
+      continue;
+    }
+    extra.push(token);
+    index += 1;
+  }
+  return { locked, extra };
+}
+
 function engineFromRuntime(model: ModelDef, runtime: RuntimeChoice): EngineForm {
+  const { locked, extra } = splitCommand(runtime.command);
+  const flagStyle = Boolean(runtime.command[0]?.startsWith("--"));
   return {
     image: runtime.image,
     codeRef: runtime.codeRef,
-    command: runtime.command.join(" "),
+    command: (flagStyle ? locked : runtime.command).join(" "),
+    commandExtra: flagStyle ? extra.join(" ") : "",
     port: runtime.port,
     healthPath: runtime.healthPath,
     protocol: runtime.protocol,
@@ -227,7 +253,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
         engine: {
           image: engine.image,
           codeRef: engine.codeRef,
-          command: parseCommand(engine.command),
+          command: [...parseCommand(engine.command), ...parseCommand(engine.commandExtra)],
           port: Number(engine.port),
           healthPath: engine.healthPath,
           protocol: engine.protocol,
@@ -380,11 +406,14 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
 
             {tab === "library" && (
               <div>
-                <p className="hint">把参数放进上面的本地库目录，或登记这台机体上已经存在的路径。登记不会移动文件。</p>
+                <p className="hint">填这台交付台 Linux 机体上的路径，不是浏览器那台电脑的盘符。登记不会移动文件。</p>
+                <p className="hint">
+                  单文件权重（如 SAM 3）填到文件，例如 <span className="mono path-example">/data/weights/sam3.pt</span>。整目录权重（如 π0.5）填目录。
+                </p>
                 <div className="form-grid">
                   <div className="field">
                     <label htmlFor="local-path">本机路径</label>
-                    <input id="local-path" className="input" value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="D:\weights\sam3" spellCheck={false} />
+                    <input id="local-path" className="input" value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/data/weights/sam3.pt" spellCheck={false} />
                   </div>
                   <div className="field">
                     <label htmlFor="local-note">备注</label>
@@ -458,7 +487,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
 
           <section className="section">
             <h2 className="section-title">运行时</h2>
-            <p className="hint">选用模型后会带上对应的运行时。这份模型有多份运行时时，在这里选。命令和端口跟着运行时走，不在装配里改。</p>
+            <p className="hint">选用模型后会带上对应的运行时。这份模型有多份运行时时，在这里选。镜像、端口、协议跟着运行时。官方引擎的启动选项可以在下面改，会写进模型包。</p>
             <RuntimeField
               options={runtimeOptions}
               image={engine.image}
@@ -469,8 +498,33 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
             />
             <p className="card-image">{engine.image}</p>
             <p className="hint">
-              {protocolLabel(engine.protocol)} · 容器内端口 {engine.port} · {engine.command || "未记录启动命令"}
+              {protocolLabel(engine.protocol)} · 容器内端口 {engine.port}
             </p>
+            {engine.command.trim().startsWith("--") ? (
+              <>
+                <div className="field" style={{ marginTop: 12 }}>
+                  <label htmlFor="command-locked">内置启动参数</label>
+                  <p id="command-locked" className="readonly-command">
+                    {engine.command}
+                  </p>
+                  <p className="hint">模型路径、监听地址和端口跟容器约定，装配时不能改。</p>
+                </div>
+                <div className="field" style={{ marginTop: 12 }}>
+                  <label htmlFor="command-extra">可改启动参数</label>
+                  <textarea
+                    id="command-extra"
+                    className="textarea"
+                    value={engine.commandExtra}
+                    onChange={(event) => setEngine({ ...engine, commandExtra: event.target.value })}
+                    placeholder={"--gpu-memory-utilization 0.5"}
+                    spellCheck={false}
+                  />
+                  <p className="hint">空格分隔，跟官方 vLLM 选项一样。例如 --gpu-memory-utilization 0.5、--max-model-len 2048。</p>
+                </div>
+              </>
+            ) : (
+              <p className="hint">{engine.command || "未记录启动命令"}</p>
+            )}
             <p className="hint">服务代码 {engine.codeRef || "未记录"}。只记录位置，不复制进模型包。</p>
             <p className="hint">健康检查 {engine.healthPath}</p>
             <p className="hint">
@@ -513,7 +567,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
             <dd>{engine.image || "—"}</dd>
             <dt>启动</dt>
             <dd>
-              {engine.command || "—"} · {engine.protocol} · {engine.port}
+              {[engine.command, engine.commandExtra].filter(Boolean).join(" ") || "—"} · {engine.protocol} · {engine.port}
             </dd>
             <dt>参数</dt>
             <dd>

@@ -1,9 +1,11 @@
-"""一个模型包一个容器。容器端口映射到宿主机上空闲的端口。"""
+"""一个模型包一个容器。容器端口映射到宿主机端口，可指定或自动分配。"""
 
 from __future__ import annotations
 
 import json
 import socket
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -37,21 +39,75 @@ def _read(package_id: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _container_running(name: str) -> bool:
+    code, output = docker_cli.run(["inspect", "-f", "{{.State.Running}}", name])
+    return code == 0 and output.strip().lower() == "true"
+
+
+def _mark_exited(record: dict) -> dict:
+    name = str(record.get("container") or "")
+    _, logs = docker_cli.run(["logs", "--tail", "80", name]) if name else (1, "")
+    record["status"] = "failed"
+    record["endpoint"] = None
+    if logs:
+        for line in logs.splitlines():
+            record["logs"].append(line)
+    record["logs"].append("容器已退出")
+    return _write(record)
+
+
+def _sync(record: dict) -> dict:
+    if record.get("status") != "running" or record.get("target") != "local":
+        return record
+    name = str(record.get("container") or "")
+    if not name:
+        return record
+    try:
+        alive = _container_running(name)
+    except RuntimeError as exc:
+        record["status"] = "failed"
+        record["endpoint"] = None
+        record["logs"].append(str(exc))
+        return _write(record)
+    if alive:
+        return record
+    return _mark_exited(record)
+
+
 def list_deploys() -> list[dict]:
     records = []
     for path in _dir().glob("pkg_*.json"):
         try:
-            records.append(json.loads(path.read_text(encoding="utf-8")))
+            record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        records.append(_sync(record))
     records.sort(key=lambda item: item.get("updatedAt", ""), reverse=True)
     return records
 
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("0.0.0.0", 0))
         return int(sock.getsockname()[1])
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _pick_host_port(requested: int | None) -> tuple[int, str]:
+    if requested is None:
+        port = _free_port()
+        return port, f"宿主机端口 {port}（自动分配）"
+    if not _port_free(requested):
+        raise HTTPException(status_code=400, detail=f"宿主机端口 {requested} 已被占用")
+    return requested, f"宿主机端口 {requested}（指定）"
 
 
 def _container(package_id: str) -> str:
@@ -105,7 +161,12 @@ def _docker_path(path: Path) -> str:
     return path.resolve().as_posix()
 
 
-def _run_args(record: dict, mounts: list[tuple[str, str]], container_weights: str) -> list[str]:
+def _run_args(
+    record: dict,
+    mounts: list[tuple[str, str]],
+    container_weights: str,
+    start_cmd: list[str] | None = None,
+) -> list[str]:
     args = [
         "run",
         "-d",
@@ -122,53 +183,34 @@ def _run_args(record: dict, mounts: list[tuple[str, str]], container_weights: st
         args.extend(["-e", f"{key}={value}"])
     if int(record.get("gpu") or 0) > 0:
         args.extend(["--gpus", "all"])
+    if "vllm" in str(record.get("image") or ""):
+        args.extend(["--ipc", "host"])
     for host, container in mounts:
         args.extend(["-v", f"{host}:{container}:ro"])
     args.append(record["image"])
+    if start_cmd:
+        args.extend(start_cmd)
     return args
 
 
-def deploy(package_id: str, target: str) -> dict:
-    if target not in {"local", "edge"}:
-        raise HTTPException(status_code=400, detail="部署目标只能是本机或边侧")
+def deploy(package_id: str, host_port: int | None = None) -> dict:
     view = get_package(package_id)
     manifest = view.manifest
     engine = manifest["engine"]
     weights = manifest["weights"]
     existing = _read(package_id)
+    if existing:
+        existing = _sync(existing)
     if existing and existing.get("status") == "running":
         return existing
-    if target == "edge":
-        if any(weight.get("source") != "s3" for weight in weights):
-            raise HTTPException(status_code=400, detail="部署到边侧时，权重都要使用 S3 地址")
-        record = {
-            "packageId": package_id,
-            "name": manifest["metadata"]["name"],
-            "target": "edge",
-            "status": "prepared",
-            "image": engine["image"],
-            "protocol": engine["protocol"],
-            "containerPort": engine["port"],
-            "hostPort": None,
-            "endpoint": None,
-            "container": "",
-            "pipeline": None,
-            "command": [],
-            "logs": [f"边侧使用已有镜像 {engine['image']}，权重保持 S3 地址。本机没有启动容器。"],
-            "gpu": engine.get("resources", {}).get("gpu", 0),
-            "env": engine.get("env") or {},
-            "createdAt": now_iso(),
-        }
-        return _write(record)
-
     if any(weight.get("source") == "s3" for weight in weights):
-        raise HTTPException(status_code=400, detail="本机部署使用本机路径。S3 地址用于边侧。")
+        raise HTTPException(status_code=400, detail="本机部署使用本机路径，不能用 S3 地址")
     code, output = docker_cli.run(["image", "inspect", engine["image"]])
     if code != 0:
         detail = output or "镜像还没构建"
         raise HTTPException(status_code=400, detail=f"镜像还没构建：{engine['image']}。{detail}")
     mounts, container_weights, pipeline = _mounts(weights)
-    host_port = _free_port()
+    host_port, port_note = _pick_host_port(host_port)
     record = {
         "packageId": package_id,
         "name": manifest["metadata"]["name"],
@@ -176,20 +218,21 @@ def deploy(package_id: str, target: str) -> dict:
         "status": "running",
         "image": engine["image"],
         "protocol": engine["protocol"],
+        "healthPath": engine.get("healthPath") or "/health",
         "containerPort": engine["port"],
         "hostPort": host_port,
         "endpoint": _endpoint(engine["protocol"], host_port),
         "container": _container(package_id),
         "pipeline": pipeline,
         "command": [],
-        "logs": [f"使用已有镜像 {engine['image']}，不再构建"],
+        "logs": [f"使用已有镜像 {engine['image']}，不再构建", port_note],
         "gpu": engine.get("resources", {}).get("gpu", 0),
         "env": engine.get("env") or {},
         "createdAt": now_iso(),
     }
     if pipeline:
         record["logs"].append(f"权重旁有 pipeline.py，容器里优先使用它：{pipeline}")
-    args = _run_args(record, mounts, container_weights)
+    args = _run_args(record, mounts, container_weights, list(engine.get("command") or []))
     record["command"] = ["docker", *args]
     docker_cli.run(["rm", "-f", record["container"]])
     code, output = docker_cli.run(args)
@@ -198,14 +241,94 @@ def deploy(package_id: str, target: str) -> dict:
         record["status"] = "failed"
         record["endpoint"] = None
         return _write(record)
-    state_code, state = docker_cli.run(["inspect", "-f", "{{.State.Running}}", record["container"]])
-    if state_code == 0 and state.strip().lower() == "false":
-        _log_code, logs = docker_cli.run(["logs", record["container"]])
-        record["status"] = "failed"
-        record["endpoint"] = None
-        if logs:
-            record["logs"].append(logs)
-    return _write(record)
+    written = _write(record)
+    return _sync(written)
+
+
+def _live(package_id: str) -> dict:
+    get_package(package_id)
+    record = _read(package_id)
+    if record:
+        record = _sync(record)
+    if not record or record.get("status") != "running" or not record.get("endpoint"):
+        raise HTTPException(status_code=400, detail="这份模型包还没有在本机运行")
+    return record
+
+
+def _request(method: str, url: str, payload: dict | None, timeout: float) -> tuple[int, dict]:
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            body = json.loads(raw) if raw else {}
+            if not isinstance(body, dict):
+                body = {"result": body}
+            return int(response.status), body
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        detail: object = raw or exc.reason
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = parsed["detail"]
+            elif isinstance(parsed, dict):
+                detail = parsed
+        except json.JSONDecodeError:
+            pass
+        raise HTTPException(status_code=int(exc.code), detail=detail) from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"连不上容器：{exc.reason}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"服务还在加载权重，稍后再做健康检查或推理：{exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="容器返回的不是 JSON") from exc
+
+
+def probe(package_id: str) -> dict:
+    record = _live(package_id)
+    path = str(record.get("healthPath") or "/health")
+    if not path.startswith("/"):
+        path = "/" + path
+    _status, body = _request("GET", f"{str(record['endpoint']).rstrip('/')}{path}", None, 10)
+    return {"ok": True, "endpoint": record["endpoint"], "body": body}
+
+
+def call_chat(package_id: str, prompt: str, max_tokens: int = 256, temperature: float = 0) -> dict:
+    record = _live(package_id)
+    if "vllm" not in str(record.get("image") or ""):
+        raise HTTPException(status_code=400, detail="这个运行时不是 OpenAI 接口，请用页面上的 /infer 测试")
+    base = str(record["endpoint"]).rstrip("/")
+    _status, models = _request("GET", f"{base}/v1/models", None, 10)
+    rows = models.get("data") if isinstance(models.get("data"), list) else []
+    model_id = rows[0].get("id") if rows and isinstance(rows[0], dict) else None
+    if not model_id:
+        raise HTTPException(status_code=502, detail="容器没有返回可用模型")
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    _status, body = _request("POST", f"{base}/v1/chat/completions", payload, 180)
+    return body
+
+
+def call_infer(package_id: str, payload: dict) -> dict:
+    record = _live(package_id)
+    if "vllm" in str(record.get("image") or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="这个运行时是官方 OpenAI 接口，请直连 /v1/chat/completions，不要走 /infer",
+        )
+    if str(record.get("protocol") or "http") != "http":
+        raise HTTPException(status_code=400, detail="这个测试页只转发 HTTP /infer")
+    _status, body = _request("POST", f"{str(record['endpoint']).rstrip('/')}/infer", payload, 300)
+    return body
 
 
 def stop(package_id: str) -> dict:

@@ -1,3 +1,7 @@
 *
 !Dockerfile
 !serve.py
+!upstream
+!upstream/**
+!torch-hub
+!torch-hub/**

@@ -1,171 +1,271 @@
-"""FlashRT 上的 π0.5。WebSocket 收发 JSON，健康检查仍是 HTTP GET /health。"""
+"""FlashRT 上的 π0.5。对外是 OpenPI 的 WebSocket 策略协议。
+
+连上后服务端先发一条 msgpack metadata。之后每条请求是 msgpack 观测，
+响应是 msgpack 动作字典，并带上 server_timing。出错时先发一段纯文本
+traceback，再用 1011 关掉这条连接。GET /healthz 返回 OpenPI 的纯文本
+OK；GET /health 仍返回 JSON，给交付台的健康检查用。
+"""
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import json
+import asyncio
+import functools
+import http
 import os
-import socket
-import struct
 import sys
+import time
+import traceback
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime_loader import resolve_fns
+import msgpack
+import numpy as np
+import websockets.asyncio.server as ws_server
+import websockets.exceptions
+import websockets.frames
 
 WEIGHTS_PATH = os.environ.get("WEIGHTS_PATH", "/weights/checkpoint")
 PORT = int(os.environ.get("PORT", "8000"))
-_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+METADATA: dict = {}
+
+
+def pack_array(obj):
+    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {obj.dtype}")
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    return obj
+
+
+def unpack_array(obj):
+    if b"__ndarray__" in obj:
+        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=obj[b"shape"])
+    if b"__npgeneric__" in obj:
+        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+    return obj
+
+
+Packer = functools.partial(msgpack.Packer, default=pack_array)
+unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array)
+
+
+def parse_image(image) -> np.ndarray:
+    """Match openpi's image parse: float [0, 1] to uint8, CHW to HWC."""
+    array = np.asarray(image)
+    if np.issubdtype(array.dtype, np.floating):
+        array = (255 * array).astype(np.uint8)
+    if array.ndim == 3 and array.shape[0] == 3:
+        array = np.moveaxis(array, 0, -1)
+    return np.ascontiguousarray(array)
+
+
+def to_model_observation(obs: dict) -> dict:
+    """Map an OpenPI env observation onto the keys FlashRT's infer reads."""
+    out = dict(obs)
+    aliases = (
+        ("observation/image", "image"),
+        ("observation/exterior_image_1_left", "image"),
+        ("observation/wrist_image", "wrist_image"),
+        ("observation/wrist_image_left", "wrist_image"),
+        ("observation/wrist_image_right", "wrist_image_right"),
+    )
+    for source, dest in aliases:
+        if dest not in out and source in obs:
+            out[dest] = obs[source]
+    for key in ("image", "wrist_image", "wrist_image_right"):
+        if key in out:
+            out[key] = parse_image(out[key])
+    if "images" in out:
+        out["images"] = [parse_image(image) for image in out["images"]]
+    return out
+
+
+def _state_of(obs: dict):
+    """状态向量，写进 π0.5 的 prompt。
+
+    LIBERO 直接给 8 维 observation/state。DROID 把关节角和夹爪拆开，
+    这里按 OpenPI 的顺序拼成关节角在前、夹爪在后。
+    """
+    for key in ("state", "observation/state", "proprio"):
+        if key in obs and obs[key] is not None:
+            return np.asarray(obs[key])
+    joints = obs.get("observation/joint_position")
+    if joints is None:
+        return None
+    joints = np.asarray(joints).reshape(-1)
+    gripper = obs.get("observation/gripper_position")
+    if gripper is None:
+        return joints
+    return np.concatenate([joints, np.asarray(gripper).reshape(-1)])
+
+
+def _packable(value):
+    if isinstance(value, dict):
+        return {key: _packable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_packable(item) for item in value]
+    if isinstance(value, (np.ndarray, np.generic)):
+        return value
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        return detach().cpu().numpy()
+    return value
+
+
+def checkpoint_framework(weights_path: str) -> str:
+    """PyTorch 目录走 torch，OpenPI 的 JAX/Orbax 目录走 jax。
+
+    jax 前端只换权重读取，后面的推理和 torch 前端是同一条 RTX 流水线。
+    """
+    root = Path(weights_path)
+    if (root / "model.safetensors").is_file():
+        return "torch"
+    if (root / "params").is_dir() or (root / "_METADATA").is_file() or (root / "manifest.ocdbt").is_file():
+        return "jax"
+    raise FileNotFoundError(
+        f"认不出 {weights_path} 的权重格式。"
+        "PyTorch 目录需要 model.safetensors，OpenPI 的 JAX 目录需要 params/。"
+    )
 
 
 def load(weights_path: str):
     if not os.path.isdir(weights_path):
         raise FileNotFoundError(f"π0.5 的权重需要是 checkpoint 目录：{weights_path}")
-    import flashrt
+    import flash_rt
 
-    loader = getattr(flashrt, "load", None)
-    if not callable(loader):
-        raise RuntimeError("镜像里的 FlashRT 没有 load(weights_path)")
-    return loader(weights_path)
-
-
-def infer(model, request: dict) -> dict:
-    if not isinstance(request, dict):
-        raise ValueError("请求需要是 JSON 对象")
-    runner = getattr(model, "infer", None)
-    if callable(runner):
-        return runner(request)
-    import flashrt
-
-    fn = getattr(flashrt, "infer", None)
-    if not callable(fn):
-        raise RuntimeError("FlashRT 没有 infer(model, request)")
-    return fn(model, request)
+    hardware = os.environ.get("FLASHRT_HARDWARE", "auto")
+    framework = checkpoint_framework(weights_path)
+    return flash_rt.load_model(weights_path, framework=framework, config="pi05", hardware=hardware)
 
 
-def accept_key(key: str) -> str:
-    digest = hashlib.sha1((key + _GUID).encode("ascii")).digest()
-    return base64.b64encode(digest).decode("ascii")
-
-
-class _Reader:
-    def __init__(self, conn: socket.socket, pending: bytes = b"") -> None:
-        self.conn = conn
-        self.buf = bytearray(pending)
-
-    def read(self, size: int) -> bytes:
-        while len(self.buf) < size:
-            piece = self.conn.recv(max(4096, size - len(self.buf)))
-            if not piece:
-                raise ConnectionError("连接已关闭")
-            self.buf.extend(piece)
-        out = bytes(self.buf[:size])
-        del self.buf[:size]
-        return out
-
-
-def read_text(reader: _Reader) -> str | None:
-    header = reader.read(2)
-    opcode = header[0] & 0x0F
-    if opcode == 0x8:
-        return None
-    length = header[1] & 0x7F
-    if length == 126:
-        length = struct.unpack("!H", reader.read(2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", reader.read(8))[0]
-    mask = reader.read(4) if header[1] & 0x80 else b""
-    payload = reader.read(length)
-    if mask:
-        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-    if opcode != 0x1:
-        return ""
-    return payload.decode("utf-8")
-
-
-def send_text(conn: socket.socket, text: str) -> None:
-    data = text.encode("utf-8")
-    if len(data) < 126:
-        header = bytes([0x81, len(data)])
-    elif len(data) < 65536:
-        header = bytes([0x81, 126]) + struct.pack("!H", len(data))
-    else:
-        header = bytes([0x81, 127]) + struct.pack("!Q", len(data))
-    conn.sendall(header + data)
-
-
-def handle(conn: socket.socket, model, infer_fn) -> None:
-    raw = b""
-    while b"\r\n\r\n" not in raw:
-        piece = conn.recv(4096)
-        if not piece:
-            return
-        raw += piece
-        if len(raw) > 65536:
-            return
-    head, _, rest = raw.partition(b"\r\n\r\n")
-    text = head.decode("latin1")
-    first = text.split("\r\n", 1)[0]
-    if first.startswith("GET /health"):
-        body = b'{"status":"ok"}'
-        conn.sendall(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-            + str(len(body)).encode()
-            + b"\r\nConnection: close\r\n\r\n"
-            + body
+def infer(model, obs: dict) -> dict:
+    if not isinstance(obs, dict):
+        raise ValueError("观测需要是字典")
+    observation = to_model_observation(obs)
+    prompt = obs.get("prompt", obs.get("text"))
+    state = _state_of(obs)
+    # VLAModel.predict 会在第一次调用时用这条观测做校准并建好 CUDA 流。
+    # 直接 infer 会跳过这一步，JAX 前端上就会缺 _graph_torch_stream。
+    predict = getattr(model, "predict", None)
+    if callable(predict) and hasattr(model, "_pipe"):
+        kwargs = {}
+        if prompt is not None:
+            kwargs["prompt"] = str(prompt)
+        if state is not None:
+            kwargs["state"] = state
+        result = predict(observation, **kwargs)
+        if not isinstance(result, dict):
+            result = {"actions": result}
+        return _packable(result)
+    setter = getattr(model, "set_prompt", None)
+    if callable(setter) and prompt is not None:
+        try:
+            setter(str(prompt), state=state)
+        except TypeError:
+            setter(str(prompt))
+    runner = getattr(model, "infer", None) or predict
+    if not callable(runner):
+        raise RuntimeError("FlashRT 模型没有 infer 或 predict")
+    try:
+        result = runner(observation)
+    except TypeError:
+        result = runner(
+            images=observation.get("images", observation.get("image")),
+            prompt=prompt,
+            state=state,
         )
-        return
-    headers = {}
-    for line in text.split("\r\n")[1:]:
-        if ":" in line:
-            key, value = line.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-    key = headers.get("sec-websocket-key", "")
-    if not key:
-        conn.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-        return
-    accept = accept_key(key)
-    conn.sendall(
-        (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-        ).encode("ascii")
+    if not isinstance(result, dict):
+        result = {"actions": result}
+    return _packable(result)
+
+
+def health_check(connection, request):
+    path = request.path.split("?", 1)[0]
+    if path == "/healthz":
+        return connection.respond(http.HTTPStatus.OK, "OK\n")
+    if path == "/health":
+        response = connection.respond(http.HTTPStatus.OK, '{"status":"ok"}')
+        del response.headers["Content-Type"]
+        response.headers["Content-Type"] = "application/json"
+        return response
+    return None
+
+
+async def serve(model, infer_fn, host: str = "0.0.0.0", port: int = PORT):
+    lock = asyncio.Lock()
+
+    async def handler(websocket):
+        packer = Packer()
+        await websocket.send(packer.pack(METADATA))
+        prev_total_time = None
+        while True:
+            try:
+                start = time.monotonic()
+                message = await websocket.recv()
+                if isinstance(message, str):
+                    raise ValueError("观测需要是 msgpack 二进制帧")
+                obs = unpackb(message)
+                infer_start = time.monotonic()
+                async with lock:
+                    action = await asyncio.to_thread(infer_fn, model, obs)
+                infer_time = time.monotonic() - infer_start
+                if not isinstance(action, dict):
+                    action = {"actions": action}
+                action = dict(action)
+                action["server_timing"] = {"infer_ms": infer_time * 1000}
+                if prev_total_time is not None:
+                    action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                await websocket.send(packer.pack(action))
+                prev_total_time = time.monotonic() - start
+            except websockets.exceptions.ConnectionClosed:
+                break
+            except Exception:
+                await websocket.send(traceback.format_exc())
+                await websocket.close(
+                    code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                    reason="Internal server error. Traceback included in previous frame.",
+                )
+                raise
+
+    return await ws_server.serve(
+        handler,
+        host,
+        port,
+        compression=None,
+        max_size=None,
+        process_request=health_check,
     )
-    reader = _Reader(conn, rest)
-    while True:
-        try:
-            message = read_text(reader)
-        except ConnectionError:
-            return
-        if message is None:
-            return
-        try:
-            request = json.loads(message) if message else {}
-            result = infer_fn(model, request)
-            send_text(conn, json.dumps(result, ensure_ascii=False))
-        except Exception as exc:
-            send_text(conn, json.dumps({"detail": str(exc)}, ensure_ascii=False))
 
 
-def main() -> None:
+async def _main() -> None:
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    common = here.parent / "common"
+    if (common / "runtime_loader.py").is_file():
+        sys.path.insert(0, str(common))
+    from runtime_loader import resolve_fns
+
     load_fn, infer_fn, pipeline = resolve_fns(WEIGHTS_PATH, load, infer)
     if pipeline:
         print(f"使用权重旁的 pipeline.py：{pipeline}", flush=True)
     model = load_fn(WEIGHTS_PATH)
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", PORT))
-    server.listen()
-    print(f"FlashRT 运行时监听 {PORT}，权重 {WEIGHTS_PATH}", flush=True)
-    while True:
-        conn, _addr = server.accept()
-        try:
-            handle(conn, model, infer_fn)
-        finally:
-            conn.close()
+    server = await serve(model, infer_fn, "0.0.0.0", PORT)
+    print(f"FlashRT 运行时监听 {PORT}，OpenPI WebSocket，权重 {WEIGHTS_PATH}", flush=True)
+    await server.serve_forever()
+
+
+def main() -> None:
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":

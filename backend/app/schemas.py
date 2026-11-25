@@ -193,11 +193,55 @@ class PackageView(BaseModel):
 
 class BuildRequest(BaseModel):
     image: str
+    force: bool = False
+
+
+class BaseCreate(BaseModel):
+    name: str
+    image: str
+    note: str = ""
 
 
 class DeployCreate(BaseModel):
     packageId: str
-    target: Literal["local", "edge"]
+    hostPort: int | None = None
+
+    @field_validator("hostPort")
+    @classmethod
+    def host_port_ok(cls, value: int | None) -> int | None:
+        if value is None:
+            return value
+        if not 1 <= value <= 65535:
+            raise ValueError("宿主机端口要在 1 到 65535")
+        return value
+
+
+class ChatRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 256
+    temperature: float = 0
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_ok(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 8000:
+            raise ValueError("请填写 1 到 8000 字的提示")
+        return value
+
+    @field_validator("max_tokens")
+    @classmethod
+    def max_tokens_ok(cls, value: int) -> int:
+        if not 1 <= value <= 2048:
+            raise ValueError("max_tokens 需要在 1 到 2048")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def temperature_ok(cls, value: float) -> float:
+        if not 0 <= value <= 2:
+            raise ValueError("temperature 需要在 0 到 2")
+        return value
 
 
 class MetaInfo(BaseModel):

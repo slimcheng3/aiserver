@@ -2,18 +2,21 @@ from __future__ import annotations
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.builds import list_jobs, start_build
+from app import docker_cli
+from app.builds import image_present, list_jobs, resume_orphans, start_build
 from app.catalog import all_models, get_model
 from app.config import catalog_path, data_root, repo_root
-from app.deploys import deploy, list_deploys, stop
+from app.deploys import call_chat, call_infer, deploy, list_deploys, probe, stop
 from app.environment import environment
 from app.packaging import create_package, delete_package, get_package, list_packages
-from app.runtimes import create_user_runtime, list_runtimes
+from app.runtimes import create_user_runtime, delete_base, known_images, list_runtimes, register_base
 from app.schemas import (
+    BaseCreate,
     BuildRequest,
+    ChatRequest,
     DeployCreate,
     LocalPathRegister,
     MetaInfo,
@@ -29,15 +32,26 @@ from app.storage import list_assets, register_local_path, register_s3, remove_as
 
 app = FastAPI(
     title="具身模型交付台",
-    summary="选出运行时，绑好权重，得到一份能在本机或边侧跑起来的模型包。",
+    summary="选出运行时，绑好权重，得到一份能在本机跑起来的模型包。",
     version="0.2.0",
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://192.168.11.49:5173",
+        "http://192.168.11.155:5173",
+    ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3})(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _resume_builds() -> None:
+    resume_orphans()
 
 
 @app.get("/api/health")
@@ -147,6 +161,7 @@ async def add_runtime(
     weightQuants: str = Form(...),
     serve: UploadFile = File(...),
     requirements: UploadFile = File(None),
+    baseImage: str = Form(""),
 ) -> dict:
     try:
         serve_source = (await serve.read()).decode("utf-8")
@@ -158,7 +173,42 @@ async def add_runtime(
     chunks = models.replace("，", ",").replace("\r", "\n").replace("\n", ",")
     model_ids = [item.strip() for item in chunks.split(",") if item.strip()]
     quants = [item.strip() for item in weightQuants.split(",") if item.strip()]
-    return create_user_runtime(name, model_ids, quants, serve_source, requirement_text)
+    return create_user_runtime(name, model_ids, quants, serve_source, requirement_text, baseImage)
+
+
+@app.post("/api/bases")
+def add_base(body: BaseCreate) -> dict:
+    return register_base(body.name, body.image, body.note)
+
+
+@app.delete("/api/bases")
+def remove_base(image: str) -> dict[str, bool]:
+    delete_base(image)
+    return {"ok": True}
+
+
+def _tar_filename(image: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in image)
+    return f"{safe}.tar"
+
+
+@app.get("/api/runtimes/tar")
+def download_runtime_tar(image: str) -> StreamingResponse:
+    image = image.strip()
+    if image not in set(known_images()):
+        raise HTTPException(status_code=404, detail="这台机体没有这份运行时")
+    try:
+        present = image_present(image)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not present:
+        raise HTTPException(status_code=404, detail="镜像还没构建，不能下载")
+    filename = _tar_filename(image)
+    return StreamingResponse(
+        docker_cli.save(image),
+        media_type="application/x-tar",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/builds")
@@ -168,7 +218,7 @@ def builds(image: str = "") -> list[dict]:
 
 @app.post("/api/builds")
 def add_build(body: BuildRequest) -> dict:
-    return start_build(body.image)
+    return start_build(body.image, body.force)
 
 
 @app.get("/api/environment")
@@ -183,7 +233,22 @@ def deploys() -> list[dict]:
 
 @app.post("/api/deploys")
 def add_deploy(body: DeployCreate) -> dict:
-    return deploy(body.packageId, body.target)
+    return deploy(body.packageId, body.hostPort)
+
+
+@app.get("/api/deploys/{pkg_id}/health")
+def deploy_health(pkg_id: str) -> dict:
+    return probe(pkg_id)
+
+
+@app.post("/api/deploys/{pkg_id}/infer")
+def deploy_infer(pkg_id: str, body: dict) -> dict:
+    return call_infer(pkg_id, body)
+
+
+@app.post("/api/deploys/{pkg_id}/chat")
+def deploy_chat(pkg_id: str, body: ChatRequest) -> dict:
+    return call_chat(pkg_id, body.prompt, body.max_tokens, body.temperature)
 
 
 @app.delete("/api/deploys/{pkg_id}")

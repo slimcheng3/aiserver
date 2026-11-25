@@ -7,6 +7,7 @@ import { NewPackagePage } from "./pages/NewPackagePage";
 import { PackageDetailPage } from "./pages/PackageDetailPage";
 import { PackagesPage } from "./pages/PackagesPage";
 import { RuntimePage } from "./pages/RuntimePage";
+import { TestPage } from "./pages/TestPage";
 
 type Route =
   | { name: "engines" }
@@ -14,7 +15,8 @@ type Route =
   | { name: "new"; model: string | null }
   | { name: "packages" }
   | { name: "package"; id: string }
-  | { name: "runtime"; packageId: string | null };
+  | { name: "runtime"; packageId: string | null }
+  | { name: "test"; packageId: string | null };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#/, "") || "/";
@@ -25,6 +27,7 @@ function parseHash(hash: string): Route {
   if (path === "/" || path === "/models" || path === "/new") return { name: "new", model: params.get("model") };
   if (path === "/packages") return { name: "packages" };
   if (path === "/runtime") return { name: "runtime", packageId: params.get("package") };
+  if (path === "/test") return { name: "test", packageId: params.get("package") };
   const match = path.match(/^\/packages\/([^/]+)$/);
   if (match) return { name: "package", id: decodeURIComponent(match[1]) };
   return { name: "new", model: null };
@@ -49,6 +52,7 @@ export function App() {
       packages: "模型包",
       package: "模型包",
       runtime: "部署",
+      test: "测试",
     };
     document.title = `${titles[route.name]} · 具身模型交付台`;
   }, [route]);
@@ -80,6 +84,9 @@ export function App() {
           <a className={route.name === "runtime" ? "side-link active" : "side-link"} href="#/runtime">
             部署
           </a>
+          <a className={route.name === "test" ? "side-link active" : "side-link"} href="#/test">
+            测试
+          </a>
         </nav>
         <div className="side-foot">
           <strong>机体存储</strong>
@@ -93,6 +100,7 @@ export function App() {
         {route.name === "packages" && <PackagesPage />}
         {route.name === "package" && <PackageDetailPage id={route.id} />}
         {route.name === "runtime" && <RuntimePage focus={route.packageId} />}
+        {route.name === "test" && <TestPage packageId={route.packageId} />}
       </main>
     </div>
   );

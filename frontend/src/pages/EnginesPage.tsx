@@ -7,9 +7,9 @@ const QUANTS: QuantType[] = ["fp16", "bf16", "int8", "awq", "gptq", "fp8"];
 
 const NOTE: Record<string, string> = {
   "local/sam3-engine:latest": "推理代码在 engines/sam3/upstream，服务入口在 engines/sam3。权重不进镜像。",
-  "local/genpose2-engine:latest": "模型代码在 D:\\playgound\\genpose2，服务代码在 engines/genpose2。",
-  "local/vllm-engine:latest": "推理代码在 vLLM 镜像里。权重是带配置和 tokenizer 的模型目录。",
-  "local/flashrt-engine:latest": "用 FlashRT 部署 π0.5。计算核来自本机 FlashRT 目录，不通过 requirements.txt 安装。",
+  "local/genpose2-engine:latest": "推理代码在 engines/genpose2/upstream。构建时编译 PointNet2，DINOv2 骨干打进镜像；Score/Energy/Scale 三个 pth 不进镜像。",
+  "local/vllm-engine:latest": "官方 vllm-openai 镜像。OpenAI 兼容接口，端口 8000；权重是带配置和 tokenizer 的模型目录，不进镜像。",
+  "local/flashrt-engine:latest": "推理代码在 engines/flashrt/upstream。构建时按本机 GPU/NPU 编译内核（4090=sm89，Orin=sm87，昇腾走 NPU 脚本）。权重不进镜像。",
   "local/base-cuda128-torch:latest": "只有 CUDA 12.8、Python 和 PyTorch。新运行时从这张镜像长出来。",
 };
 
@@ -18,16 +18,18 @@ export function EnginesPage() {
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
   const [env, setEnv] = useState<EnvironmentInfo | null>(null);
   const [building, setBuilding] = useState<Record<string, boolean>>({});
+  const [jobs, setJobs] = useState<import("../types").BuildJob[]>([]);
   const [error, setError] = useState("");
 
   function reload() {
     return Promise.all([api.models(), api.runtimes(), api.environment(), api.builds("")]).then(
-      ([modelList, runtimeList, environment, jobs]) => {
+      ([modelList, runtimeList, environment, buildJobs]) => {
         setModels(modelList);
         setRuntimes(runtimeList);
         setEnv(environment);
+        setJobs(buildJobs);
         const active: Record<string, boolean> = {};
-        for (const job of jobs) {
+        for (const job of buildJobs) {
           if (job.status === "running" || job.status === "queued") active[job.image] = true;
         }
         setBuilding(active);
@@ -44,7 +46,7 @@ export function EnginesPage() {
       <p className="page-kicker">同一台机体</p>
       <h1 className="page-title">运行时</h1>
       <p className="page-lead">
-        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。镜像已经在本机时不再构建。
+        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。登记基础镜像时，本机没有的会从仓库拉取。镜像已经在本机时，普通构建会跳过；服务代码改过之后，用重新构建再打一次。本机已经有的运行时可以下载成 tar，另一台机器用 docker load -i 导入。权重不在这个包里。
       </p>
       {error && <p className="error">{error}</p>}
       {env && (
@@ -75,7 +77,14 @@ export function EnginesPage() {
           {runtimes
             .filter((runtime) => runtime.kind === "base")
             .map((runtime) => (
-              <RuntimeCard key={runtime.image} runtime={runtime} models={models} env={env} building={building} />
+              <RuntimeCard
+                key={runtime.image}
+                runtime={runtime}
+                models={models}
+                env={env}
+                building={building}
+                onChanged={() => reload().catch((reason: Error) => setError(reason.message))}
+              />
             ))}
           {runtimes
             .filter((runtime) => runtime.kind === "user")
@@ -84,7 +93,14 @@ export function EnginesPage() {
             ))}
         </div>
         {runtimes.every((runtime) => runtime.kind !== "user") && <p className="empty">还没有自定义运行时。</p>}
-        <NewRuntimeForm onCreated={() => reload().catch((reason: Error) => setError(reason.message))} />
+        <NewBaseForm
+          pulling={jobs.find((job) => job.action === "pull" && (job.status === "running" || job.status === "queued")) ?? null}
+          onCreated={() => reload().catch((reason: Error) => setError(reason.message))}
+        />
+        <NewRuntimeForm
+          bases={runtimes.filter((runtime) => runtime.kind === "base")}
+          onCreated={() => reload().catch((reason: Error) => setError(reason.message))}
+        />
       </section>
     </div>
   );
@@ -95,15 +111,53 @@ function RuntimeCard({
   models,
   env,
   building,
+  onChanged,
 }: {
   runtime: RuntimeInfo;
   models: ModelDef[];
   env: EnvironmentInfo | null;
   building: Record<string, boolean>;
+  onChanged?: () => void;
 }) {
   const ready = Boolean(env?.images[runtime.image]);
   const active = Boolean(building[runtime.image]);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [cardError, setCardError] = useState("");
   const kindLabel = runtime.kind === "base" ? "基础镜像" : runtime.kind === "user" ? "自定义" : "内置";
+  const registeredBase = runtime.kind === "base" && !runtime.codeRef;
+  const buildHref = `#/build?image=${encodeURIComponent(runtime.image)}`;
+
+  async function rebuild() {
+    setRebuilding(true);
+    setCardError("");
+    try {
+      await api.startBuild(runtime.image, true);
+      location.hash = buildHref;
+    } catch (reason) {
+      setCardError(reason instanceof Error ? reason.message : "重新构建没有开始");
+      setRebuilding(false);
+    }
+  }
+
+  async function removeBase() {
+    if (!window.confirm(`取消登记「${runtime.name}」？本机上的镜像文件会留着。`)) return;
+    setCardError("");
+    try {
+      await api.deleteBase(runtime.image);
+      onChanged?.();
+    } catch (reason) {
+      setCardError(reason instanceof Error ? reason.message : "取消登记失败");
+    }
+  }
+
+  const hint =
+    NOTE[runtime.image] ??
+    (runtime.kind === "base"
+      ? runtime.note || "登记的基础镜像。登记时如果本机没有，会从仓库拉取。交付台不会替它构建。"
+      : runtime.baseImage
+        ? `父镜像 ${runtime.baseImage}。服务代码随这份运行时保存。`
+        : "服务代码随这份运行时保存，父镜像是基础镜像。");
+
   return (
     <article className="model-card" data-kind={runtime.kind} data-tone={toneFor(runtime, models)}>
       <div className="card-top">
@@ -117,7 +171,7 @@ function RuntimeCard({
       <p className="hint">
         {protocolLabel(runtime.protocol)} · 容器内端口 {runtime.port} · {runtime.command.join(" ")}
       </p>
-      <p className="hint">{NOTE[runtime.image] ?? "服务代码随这份运行时保存，父镜像是基础镜像。"}</p>
+      <p className="hint">{hint}</p>
       {runtime.codeRef && <p className="hint">服务代码 {runtime.codeRef}</p>}
       {runtime.models.length > 0 && (
         <p className="hint">
@@ -131,13 +185,35 @@ function RuntimeCard({
         </p>
       )}
       {runtime.weightQuants.length > 0 && <p className="hint">支持的权重：{runtime.weightQuants.join("、")}</p>}
-      {runtime.kind !== "base" && !ready && (
+      {(runtime.kind !== "base" || ready || registeredBase) && (
         <div className="card-actions">
-          <a className="btn primary" href={`#/build?image=${encodeURIComponent(runtime.image)}`}>
-            {active ? "构建中" : runtime.kind === "user" ? "构建这份运行时" : "第一次构建"}
-          </a>
+          {registeredBase && (
+            <button type="button" className="btn" onClick={() => void removeBase()}>
+              取消登记
+            </button>
+          )}
+          {runtime.kind !== "base" &&
+            (active ? (
+              <a className="btn" href={buildHref}>
+                构建中
+              </a>
+            ) : ready ? (
+              <button type="button" className="btn" disabled={rebuilding} onClick={() => void rebuild()}>
+                {rebuilding ? "正在开始…" : "重新构建"}
+              </button>
+            ) : (
+              <a className="btn primary" href={buildHref}>
+                {runtime.kind === "user" ? "构建这份运行时" : "第一次构建"}
+              </a>
+            ))}
+          {ready && (
+            <a className="btn tar-download" href={`/api/runtimes/tar?image=${encodeURIComponent(runtime.image)}`}>
+              下载 tar
+            </a>
+          )}
         </div>
       )}
+      {cardError && <p className="error">{cardError}</p>}
     </article>
   );
 }
@@ -147,8 +223,113 @@ function toneFor(runtime: RuntimeInfo, models: ModelDef[]): string {
   return model?.tone ?? "ink";
 }
 
-function NewRuntimeForm({ onCreated }: { onCreated: () => void }) {
+function NewBaseForm({ pulling, onCreated }: { pulling: import("../types").BuildJob | null; onCreated: () => void }) {
   const [name, setName] = useState("");
+  const [image, setImage] = useState("");
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function waitForPull(job: import("../types").BuildJob, target: string) {
+    let current = job;
+    while (current.status === "running" || current.status === "queued") {
+      setNotice(current.logs[current.logs.length - 1] ?? `正在从仓库拉取 ${target}`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const listed = await api.builds(target);
+      current = listed.find((item) => item.id === current.id) ?? current;
+    }
+    if (current.status === "failed") {
+      const detail = [...current.logs].reverse().find((line) => line && line !== "拉取失败");
+      throw new Error(detail ?? "拉取失败");
+    }
+  }
+
+  useEffect(() => {
+    if (!pulling) return;
+    let stop = false;
+    setSaving(true);
+    setError("");
+    waitForPull(pulling, pulling.image)
+      .then(() => {
+        if (stop) return;
+        setNotice(`已登记 ${pulling.image}。新建运行时时可以选它作为父镜像。`);
+        onCreated();
+      })
+      .catch((reason: Error) => {
+        if (!stop) setError(reason.message);
+      })
+      .finally(() => {
+        if (!stop) setSaving(false);
+      });
+    return () => {
+      stop = true;
+    };
+  }, [pulling?.id]);
+
+  async function submit() {
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const created = await api.registerBase({ name, image, note });
+      if (created.job && created.job.status !== "ready" && created.job.status !== "failed") {
+        await waitForPull(created.job, image.trim());
+      }
+      if (created.job?.status === "failed") {
+        throw new Error(created.job.logs[created.job.logs.length - 1] ?? "拉取失败");
+      }
+      setNotice("已登记。新建运行时时可以选它作为父镜像。");
+      setName("");
+      setImage("");
+      setNote("");
+      onCreated();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "登记失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="section">
+      <h2 className="section-title">登记基础镜像</h2>
+      <p className="hint">镜像名要带标签。本机已经有的会直接登记；没有的会按这个名字从仓库拉取，例如 nvcr.io/nvidia/pytorch:24.08-py3。拉取可能较久，完成前请留在此页。</p>
+      {error && <p className="error">{error}</p>}
+      {notice && <p className="ok">{notice}</p>}
+      <div className="form-grid">
+        <div className="field">
+          <label htmlFor="base-name">名称</label>
+          <input id="base-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 CUDA 12.4" />
+        </div>
+        <div className="field">
+          <label htmlFor="base-image">镜像名</label>
+          <input
+            id="base-image"
+            className="input"
+            value={image}
+            onChange={(event) => setImage(event.target.value)}
+            placeholder="nvcr.io/nvidia/pytorch:24.08-py3"
+            spellCheck={false}
+          />
+        </div>
+        <div className="field span-2">
+          <label htmlFor="base-note">说明，可以不填</label>
+          <input id="base-note" className="input" value={note} onChange={(event) => setNote(event.target.value)} />
+        </div>
+      </div>
+      <div className="toolbar" style={{ marginTop: 12 }}>
+        <button type="button" className="btn" disabled={saving} onClick={() => void submit()}>
+          {saving ? "正在登记或拉取…" : "登记"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function NewRuntimeForm({ bases, onCreated }: { bases: RuntimeInfo[]; onCreated: () => void }) {
+  const [name, setName] = useState("");
+  const [baseImage, setBaseImage] = useState("");
   const [modelsText, setModelsText] = useState("");
   const [quants, setQuants] = useState<QuantType[]>(["fp16"]);
   const [serve, setServe] = useState<File | null>(null);
@@ -156,6 +337,7 @@ function NewRuntimeForm({ onCreated }: { onCreated: () => void }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
+  const selectedBase = bases.some((item) => item.image === baseImage) ? baseImage : (bases[0]?.image ?? "");
 
   function toggle(list: string[], value: string, on: boolean): string[] {
     return on ? [...list, value] : list.filter((item) => item !== value);
@@ -183,10 +365,16 @@ function NewRuntimeForm({ onCreated }: { onCreated: () => void }) {
       body.set("name", name);
       body.set("models", modelIds.join(","));
       body.set("weightQuants", quants.join(","));
+      body.set("baseImage", selectedBase);
       body.set("serve", serve);
       if (requirements) body.set("requirements", requirements);
       const created = await api.createRuntime(body);
-      setNotice(`已保存 ${created.name}。构建这份运行时的时候，如果本机还没有基础镜像，会先构建基础镜像。`);
+      const parent = bases.find((item) => item.image === selectedBase);
+      setNotice(
+        parent?.codeRef
+          ? `已保存 ${created.name}。构建时如果本机还没有 ${selectedBase}，会先构建这张基础镜像。`
+          : `已保存 ${created.name}。构建时使用父镜像 ${selectedBase}。`,
+      );
       setName("");
       setModelsText("");
       setServe(null);
@@ -211,6 +399,16 @@ function NewRuntimeForm({ onCreated }: { onCreated: () => void }) {
         <div className="field">
           <label htmlFor="runtime-name">名称</label>
           <input id="runtime-name" className="input" value={name} onChange={(event) => setName(event.target.value)} />
+        </div>
+        <div className="field">
+          <label htmlFor="runtime-base">基础镜像</label>
+          <select id="runtime-base" className="select" value={selectedBase} onChange={(event) => setBaseImage(event.target.value)}>
+            {bases.map((item) => (
+              <option key={item.image} value={item.image}>
+                {item.name === item.image ? item.image : `${item.name} · ${item.image}`}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="field">
           <div className="label-line">

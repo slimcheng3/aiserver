@@ -200,6 +200,9 @@ button, input, textarea, select { font: inherit; color: inherit; }
   align-items: center;
 }
 
+.model-card .card-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: auto; }
+.card-actions .tar-download { margin-left: auto; }
+
 .card-vendor, .hint, .muted { color: var(--muted); }
 
 .card-name { margin: 0; font-size: 26px; line-height: 1.2; }
@@ -227,6 +230,11 @@ button, input, textarea, select { font: inherit; color: inherit; }
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 12px;
   word-break: break-all;
+}
+
+.path-example {
+  word-break: normal;
+  white-space: nowrap;
 }
 
 .card-image { margin: 0; color: #b7c9c0; }
@@ -313,7 +321,25 @@ button, input, textarea, select { font: inherit; color: inherit; }
   color: var(--ink);
 }
 
+.input.port-input {
+  width: 88px;
+  padding: 6px 8px;
+}
+
 .textarea { min-height: 88px; resize: vertical; }
+
+.readonly-command {
+  margin: 0;
+  border: 1px solid #31423b;
+  background: #101816;
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+}
 
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
 
@@ -436,14 +462,31 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .call-list dt { color: var(--muted); font-size: 12px; }
 .call-list dd { margin: 0 0 8px; }
 
+.build-progress { margin: 0 0 12px; }
+.build-progress-bar {
+  height: 6px;
+  background: #24302b;
+  border-radius: 99px;
+  overflow: hidden;
+}
+.build-progress-bar > span {
+  display: block;
+  height: 100%;
+  background: #3dcc8a;
+}
+
 .log-list {
   margin: 0 0 14px;
+  max-height: 360px;
+  overflow: auto;
   padding: 12px 12px 12px 28px;
   background: #141a18;
   color: #e7efe9;
   border-radius: 12px;
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .drop {
@@ -465,9 +508,48 @@ button, input, textarea, select { font: inherit; color: inherit; }
   cursor: pointer;
 }
 
+.test-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.test-stage {
+  background: #0a100e;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  min-height: 240px;
+}
+
+.test-canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 10px;
+  background: #101816;
+}
+
+.mask-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mask-thumbs img {
+  width: 88px;
+  height: 88px;
+  object-fit: contain;
+  background: #141a18;
+  border-radius: 8px;
+}
+
 @media (max-width: 1100px) {
   .composer { grid-template-columns: 1fr; }
   .preview { position: static; }
+  .test-layout { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 860px) {

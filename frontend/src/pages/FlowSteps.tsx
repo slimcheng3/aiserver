@@ -2,7 +2,7 @@ const STEPS = [
   { label: "取运行时", detail: "每个栈一次" },
   { label: "构建镜像", detail: "已有则跳过" },
   { label: "装配模型包", detail: "绑参数" },
-  { label: "部署", detail: "本机或边侧" },
+  { label: "部署", detail: "本机容器" },
   { label: "调用", detail: "直连宿主机端口" },
 ];
 

@@ -49,7 +49,15 @@ def infer(model, request: dict) -> dict:
         model.confidence_threshold = float(threshold)
 
     image = _decode_image(image_b64)
-    state = model.set_text_prompt(prompt=text, state=model.set_image(image))
+    import torch
+
+    # ViT MLP 的 fused addmm 会把中间结果打成 bfloat16；没有 autocast 时，
+    # 下一层 Linear 仍是 float32，会报 mat1/mat2 dtype 不一致。
+    if torch.cuda.is_available():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            state = model.set_text_prompt(prompt=text, state=model.set_image(image))
+    else:
+        state = model.set_text_prompt(prompt=text, state=model.set_image(image))
     return _pack(state)
 
 
@@ -106,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length).decode("utf-8"))
-            self._json(200, self.infer_fn(self.processor, request))
+            self._json(200, Handler.infer_fn(self.processor, request))
         except ValueError as exc:
             self._json(400, {"detail": str(exc)})
         except Exception as exc:

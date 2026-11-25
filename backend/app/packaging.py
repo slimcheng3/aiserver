@@ -53,6 +53,40 @@ def get_package(pkg_id: str) -> PackageView:
     return _view(folder)
 
 
+_LOCKED_FLAGS = ("--model", "--host", "--port")
+
+
+def _split_cli(parts: list[str]) -> tuple[list[str], list[str]]:
+    locked: list[str] = []
+    extra: list[str] = []
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token in _LOCKED_FLAGS:
+            locked.append(token)
+            index += 1
+            if index < len(parts) and not parts[index].startswith("-"):
+                locked.append(parts[index])
+                index += 1
+            continue
+        extra.append(token)
+        index += 1
+    return locked, extra
+
+
+def _command_for_package(runtime: dict, submitted: list[str]) -> list[str]:
+    catalog = [str(part) for part in runtime["command"]]
+    if not catalog or not str(catalog[0]).startswith("--"):
+        return catalog
+    locked, catalog_extra = _split_cli(catalog)
+    command = [str(part).strip() for part in submitted if str(part).strip()]
+    if command and command[0].startswith("-"):
+        _, extra = _split_cli(command)
+    else:
+        extra = catalog_extra
+    return locked + extra
+
+
 def delete_package(pkg_id: str) -> None:
     _check_id(pkg_id)
     folder = data_root() / "packages" / pkg_id
@@ -149,7 +183,7 @@ def create_package(body: PackageCreate) -> PackageView:
         "engine": {
             "image": runtime["image"],
             "codeRef": runtime["codeRef"],
-            "command": list(runtime["command"]),
+            "command": _command_for_package(runtime, body.engine.command),
             "port": runtime["port"],
             "healthPath": runtime["healthPath"],
             "protocol": runtime["protocol"],

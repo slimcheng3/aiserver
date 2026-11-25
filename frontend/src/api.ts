@@ -65,22 +65,43 @@ export const api = {
     request<{ ok: boolean }>(`/api/weights?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
   runtimes: () => request<RuntimeInfo[]>("/api/runtimes"),
   createRuntime: (body: FormData) => request<RuntimeInfo>("/api/runtimes", { method: "POST", body }),
+  registerBase: (body: { name: string; image: string; note: string }) =>
+    request<{ base: RuntimeInfo | null; job: BuildJob | null }>("/api/bases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  deleteBase: (image: string) =>
+    request<{ ok: boolean }>(`/api/bases?image=${encodeURIComponent(image)}`, { method: "DELETE" }),
   environment: () => request<EnvironmentInfo>("/api/environment"),
   builds: (image: string) => request<BuildJob[]>(`/api/builds?image=${encodeURIComponent(image)}`),
-  startBuild: (image: string) =>
+  startBuild: (image: string, force = false) =>
     request<BuildJob>("/api/builds", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image }),
+      body: JSON.stringify({ image, force }),
     }),
   deploys: () => request<Deployment[]>("/api/deploys"),
-  deploy: (packageId: string, target: "local" | "edge") =>
+  deploy: (packageId: string, hostPort?: number) =>
     request<Deployment>("/api/deploys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ packageId, target }),
+      body: JSON.stringify({ packageId, hostPort: hostPort ?? null }),
     }),
   stopDeploy: (packageId: string) => request<Deployment>(`/api/deploys/${packageId}`, { method: "DELETE" }),
+  deployHealth: (packageId: string) => request<{ ok: boolean; endpoint: string; body: Record<string, unknown> }>(`/api/deploys/${packageId}/health`),
+  infer: (packageId: string, body: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/deploys/${packageId}/infer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  chat: (packageId: string, body: { prompt: string; max_tokens?: number; temperature?: number }) =>
+    request<Record<string, unknown>>(`/api/deploys/${packageId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 };
 
 export function uploadWeight(file: File, onProgress: (ratio: number) => void): Promise<WeightAsset> {

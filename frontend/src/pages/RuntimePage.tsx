@@ -3,9 +3,20 @@ import { api } from "../api";
 import { protocolLabel } from "../format";
 import type { Deployment, PackageView } from "../types";
 
+function parseHostPort(raw: string): number | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+  const port = Number(text);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("宿主机端口要填 1 到 65535 的整数，留空则自动分配");
+  }
+  return port;
+}
+
 export function RuntimePage({ focus }: { focus: string | null }) {
   const [packages, setPackages] = useState<PackageView[]>([]);
   const [deploys, setDeploys] = useState<Deployment[]>([]);
+  const [hostPorts, setHostPorts] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
 
   function reload() {
@@ -17,14 +28,19 @@ export function RuntimePage({ focus }: { focus: string | null }) {
 
   useEffect(() => {
     reload().catch((reason: Error) => setError(reason.message));
+    const timer = window.setInterval(() => {
+      reload().catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
   }, []);
 
-  async function start(view: PackageView, target: "local" | "edge") {
+  async function start(view: PackageView) {
     setError("");
     try {
-      await api.deploy(view.manifest.metadata.id, target);
+      const hostPort = parseHostPort(hostPorts[view.manifest.metadata.id] ?? "");
+      await api.deploy(view.manifest.metadata.id, hostPort);
       await reload();
-      location.hash = `#/runtime?package=${view.manifest.metadata.id}`;
+      location.hash = `#/test?package=${view.manifest.metadata.id}`;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "部署失败");
     }
@@ -44,10 +60,10 @@ export function RuntimePage({ focus }: { focus: string | null }) {
 
   return (
     <div className="page">
-      <p className="page-kicker">本机或边侧</p>
+      <p className="page-kicker">本机</p>
       <h1 className="page-title">部署</h1>
       <p className="page-lead">
-        每个模型包对应一个容器。容器端口映射到宿主机上一个空闲端口，调用直接连这个端口。部署使用已经构建好的镜像，不再构建。边侧只接受 S3 地址，并且不在这台机体上启动容器。
+        每个模型包对应一个容器。容器内端口固定，宿主机端口可以指定，留空则自动分配。调用直接连这个宿主机端口。部署使用已经构建好的镜像，不再构建。
       </p>
       {error && <p className="error">{error}</p>}
 
@@ -58,9 +74,9 @@ export function RuntimePage({ focus }: { focus: string | null }) {
           <span>HTTP 和 WebSocket 都直接连这里</span>
         </div>
         <div className="fact">
-          <span>边侧</span>
-          <strong>S3 权重</strong>
-          <span>本机路径不能拿到边侧去</span>
+          <span>权重</span>
+          <strong>本机路径</strong>
+          <span>挂进容器，不复制进镜像</span>
         </div>
         <div className="fact">
           <span>运行时</span>
@@ -82,6 +98,7 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                 <th>名称</th>
                 <th>镜像</th>
                 <th>协议</th>
+                <th>端口号</th>
                 <th></th>
               </tr>
             </thead>
@@ -89,6 +106,7 @@ export function RuntimePage({ focus }: { focus: string | null }) {
               {packages.map((item) => {
                 const id = item.manifest.metadata.id;
                 const current = deploys.find((deploy) => deploy.packageId === id && deploy.status !== "stopped");
+                const blocking = current && (current.status === "running" || current.status === "prepared");
                 return (
                   <tr key={id}>
                     <td>
@@ -100,17 +118,40 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                     <td className="mono">{item.manifest.engine.image}</td>
                     <td>{protocolLabel(item.manifest.engine.protocol)}</td>
                     <td>
-                      {current ? (
-                        <a className="btn small" href={`#/runtime?package=${id}`}>
-                          {statusLabel(current.status)}
-                        </a>
+                      {blocking && current?.hostPort ? (
+                        <span className="mono">{current.hostPort}</span>
+                      ) : (
+                        <input
+                          className="input port-input"
+                          inputMode="numeric"
+                          placeholder={current?.hostPort ? String(current.hostPort) : "自动"}
+                          value={hostPorts[id] ?? ""}
+                          onChange={(event) => setHostPorts((ports) => ({ ...ports, [id]: event.target.value }))}
+                          aria-label="端口号，留空自动分配"
+                        />
+                      )}
+                    </td>
+                    <td>
+                      {blocking && current ? (
+                        <span className="toolbar">
+                          <a className="btn small" href={`#/runtime?package=${id}`}>
+                            {statusLabel(current.status)}
+                          </a>
+                          {current.status === "running" && (
+                            <a className="btn primary small" href={`#/test?package=${id}`}>
+                              测试
+                            </a>
+                          )}
+                        </span>
                       ) : (
                         <span className="toolbar">
-                          <button type="button" className="btn primary small" onClick={() => void start(item, "local")}>
-                            部署到本机
-                          </button>
-                          <button type="button" className="btn small" onClick={() => void start(item, "edge")}>
-                            部署到边侧
+                          {current?.status === "failed" && (
+                            <a className="btn small" href={`#/runtime?package=${id}`}>
+                              失败
+                            </a>
+                          )}
+                          <button type="button" className="btn primary small" onClick={() => void start(item)}>
+                            {current?.status === "failed" ? "重新部署" : "部署"}
                           </button>
                         </span>
                       )}
@@ -139,13 +180,13 @@ function ServicePanel({ service, onStop }: { service: Deployment; onStop: () => 
         <span className={`badge ${service.status === "prepared" ? "ready" : service.status}`}>{statusLabel(service.status)}</span>
       </div>
       <p className="hint">
-        {service.target === "edge" ? "边侧" : "本机"} · {service.image} · {protocolLabel(service.protocol)}
+        本机 · {service.image} · {protocolLabel(service.protocol)}
         {service.pipeline ? " · 使用权重旁的 pipeline.py" : ""}
       </p>
       <dl className="call-list">
         <div>
           <dt>调用入口</dt>
-          <dd className="mono">{service.endpoint ?? "边侧自行映射端口"}</dd>
+          <dd className="mono">{service.endpoint ?? "还没有映射端口"}</dd>
         </div>
         <div>
           <dt>健康检查</dt>
@@ -168,6 +209,11 @@ function ServicePanel({ service, onStop }: { service: Deployment; onStop: () => 
         <button type="button" className="btn" disabled={service.status === "stopped" || service.status === "prepared"} onClick={onStop}>
           停止
         </button>
+        {service.status === "running" && (
+          <a className="btn primary" href={`#/test?package=${service.packageId}`}>
+            测试
+          </a>
+        )}
         <a className="btn" href={`#/packages/${service.packageId}`}>
           查看模型包
         </a>
@@ -178,7 +224,7 @@ function ServicePanel({ service, onStop }: { service: Deployment; onStop: () => 
 
 function statusLabel(status: Deployment["status"]): string {
   if (status === "running") return "运行中";
-  if (status === "prepared") return "待边侧启动";
+  if (status === "prepared") return "待启动";
   if (status === "failed") return "失败";
   return "已停止";
 }

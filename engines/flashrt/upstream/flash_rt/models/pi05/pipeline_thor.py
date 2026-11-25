@@ -1,0 +1,1273 @@
+"""FlashRT — Pi0.5 Thor SM110 decoder pipeline (B=1, main-line path).
+
+Pi0.5-specific Thor compute (AdaRMSNorm action expert decoder + the
+calibration twin). SigLIP / encoder live in
+``hardware/thor/shared_primitives`` because they are reused by Pi0,
+GROOT, and Pi0-FAST. ``decoder_forward`` is Pi0.5-specific
+(AdaRMSNorm with style modulation; Pi0 and GROOT have different
+decoders) so it must NOT live in shared_primitives — see the unified
+pipeline_<hw>.py contract in docs/adding_new_model.md §0.
+
+This file holds the **B=1 main-line single-sample inference path**.
+The B>=1 batched companion lives in
+:mod:`flash_rt.models.pi05.pipeline_thor_batched` (mirrors the RTX
+``pipeline_rtx`` / ``pipeline_rtx_batched`` split). The CFG variants
+live in :mod:`flash_rt.models.pi05.pipeline_thor_cfg` (serial) and
+:mod:`flash_rt.models.pi05.pipeline_thor_cfg_batched` (B=2 fused).
+
+Functions:
+    decoder_forward            — Pi0.5 decoder inference (static FP8)
+    decoder_forward_calibrate  — Pi0.5 decoder FP8 scale calibration
+
+Classes:
+    Pi05ThorPipeline           — B=1 facade for SigLIP + enc_ae replay
+"""
+
+import ctypes
+import math
+
+from flash_rt.hardware.thor.shared_primitives import (
+    _measure_scale_gpu,
+    _gpu_copy,
+    _gpu_sync,
+    _gpu_zero,
+)
+
+
+def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
+                        stream, dt=None, scratch_f32=None, aob_dt=None):
+    if dt is None:
+        fvk.gmm_fp16(ctx, xn, aow, noise, rows, cols, dim, 1.0, stream)
+        fvk.add_bias_fp16(noise, aob, rows, cols, stream)
+    elif scratch_f32 is not None:
+        fvk.gmm_fp16_out_fp32(ctx, xn, aow, scratch_f32, rows, cols, dim,
+                              stream)
+        fvk.action_update_from_fp32(scratch_f32, aob, noise, rows, cols,
+                                    float(dt), True, stream)
+    else:
+        if aob_dt is None:
+            raise ValueError("aob_dt is required for dt fallback path")
+        fvk.gmm_fp16_alpha(ctx, xn, aow, noise, rows, cols, dim,
+                           float(dt), 1.0, stream)
+        fvk.add_bias_fp16(noise, aob_dt, rows, cols, stream)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Decoder (18 layers, 10 diffusion steps, static FP8)
+# ══════════════════════════════════════════════════════════════════
+
+def _copy_rtc_prefix(bufs, dims, stream: int, prefix_len: int) -> None:
+    if prefix_len <= 0:
+        return
+    if prefix_len > int(dims["S"]):
+        raise ValueError(
+            f"rtc prefix_len {prefix_len} exceeds chunk_size {dims['S']}")
+    prev = bufs.get("rtc_prev_action_chunk")
+    if not prev:
+        raise ValueError("rtc_prev_action_chunk buffer is required")
+    _gpu_copy(bufs["noise"], prev, int(prefix_len) * 32 * 2, stream)
+
+
+def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
+                    use_fp8=True, rtc_prefix_len: int = 0):
+    """Full AE decoder forward pass ≡ pi05 ae_forward_static.
+
+    Args:
+        ctx: FvkContext (C++ object with cuBLAS handle)
+        fvk: flash_rt_kernels module
+        bufs: dict of GPU buffer pointers (uintptr_t)
+            noise, x, xn, gate, qkv, logits, attn_out, hid, fg,
+            xn_fp8, hid_fp8, ctx_fp8     [xn_fp8/hid_fp8/ctx_fp8 only when use_fp8=True]
+        weights: dict of GPU buffer pointers
+            ain_w, ain_b, sa, qw, Kc, Vc, ow, sf, gw, dw,
+            aow, aob, fs, rope, w_scales, act_scales
+            (w_scales/act_scales unused when use_fp8=False — weights are FP16)
+        dims: dict
+            S, D, H, NH, HD, steps, layers, enc_seq, total_keys
+        stream: CUDA stream (int)
+        use_fp8: When True (default) run the production static-FP8 path.
+            When False, every GEMM uses ``fvk.gmm_fp16`` and the fused
+            FP8 norm/quantize kernels are split into their FP16
+            equivalents (``adarms_fp16``, ``gate_res_fp16``,
+            ``gate_geglu_merged_fp16``). Used for FP16 baseline runs.
+        rtc_prefix_len: Optional prefix length for RTC prefix-lock action
+            graphs. When non-zero, the prefix rows of ``noise`` are restored
+            from ``bufs['rtc_prev_action_chunk']`` before each denoise step and
+            after each action update.
+    """
+    if not use_fp8:
+        return _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream,
+                                      attn=attn,
+                                      rtc_prefix_len=rtc_prefix_len)
+    S = dims['S']
+    D = dims['D']
+    H = dims['H']
+    NH = dims['NH']
+    HD = dims['HD']
+    steps = dims['steps']
+    layers = dims['layers']
+    enc_seq = dims['enc_seq']
+    total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
+    D3 = 3 * D
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    # Buffer pointers
+    noise = bufs['noise']
+    x = bufs['x']
+    xn = bufs['xn']
+    gate = bufs['gate']
+    qkv = bufs['qkv']
+    logits = bufs['logits']
+    attn_out = bufs['attn_out']
+    hid = bufs['hid']
+    fg = bufs['fg']
+    action_f32 = bufs.get('action_f32')
+    xn_fp8 = bufs['xn_fp8']
+    hid_fp8 = bufs['hid_fp8']
+    ctx_fp8 = bufs['ctx_fp8']
+
+    # Weight pointers
+    ain_w = weights['ain_w']
+    ain_b = weights['ain_b']
+    sa = weights['sa']
+    qw = weights['qw']
+    Kc = weights['Kc']
+    Vc = weights['Vc']
+    ow = weights['ow']
+    sf = weights['sf']
+    gw = weights['gw']
+    dw = weights['dw']
+    aow = weights['aow']
+    aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
+    dt = weights.get('dt')
+    fs = weights['fs']
+    rope = weights['rope']
+    w_scales = weights['w_scales']
+    act_scales = weights['act_scales']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
+
+    for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+        step_scale_base = s * layers * 4
+        # ── Action input: noise → x ──
+        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            # ── C1: Fused AdaRMSNorm → FP8 with static scale ──
+            act_scale_qkv = act_scales + (step_scale_base + l * 4 + 0) * 4
+            if l == 0:
+                fvk.fused_adarms_fp8_static_fp16(
+                    x, sa_ptr, xn_fp8, gate, S, D, act_scale_qkv, stream)
+
+            # ── C2: QKV GEMM with descale ──
+            w_scale_qkv = w_scales + (l * 4 + 0) * 4
+            qw_ptr = qw + l * D * 2560
+            fvk.fp8_gemm_descale_fp16(xn_fp8, qw_ptr, qkv, S, 2560, D,
+                                       act_scale_qkv, w_scale_qkv, stream)
+
+            # ── C2b: Fused RoPE + QKV split + KV cache ──
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, K_dim, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                 S, Q_dim, K_dim, HD, 2560,
+                                                 kv_offset, HD, stream)
+
+            # ── C3: Cross-attention ──
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                                        logits, attn_out,
+                                        S, total_keys, NH, HD, attn_scale, stream)
+
+            # ── C4: O proj ──
+            act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4
+            w_scale_o = w_scales + (l * 4 + 1) * 4
+            fvk.quantize_fp8_static_fp16(attn_out, ctx_fp8, act_scale_o, S * NH * HD, stream)
+            ow_ptr = ow + l * NH * HD * D
+            fvk.fp8_gemm_descale_fp16(ctx_fp8, ow_ptr, fg, S, D, NH * HD,
+                                       act_scale_o, w_scale_o, stream)
+
+            # ── C4→C5: gate×residual + AdaRMSNorm → FP8 ──
+            act_scale_gu = act_scales + (step_scale_base + l * 4 + 2) * 4
+            fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sf_ptr,
+                                                  xn_fp8, gate, S, D, act_scale_gu, stream)
+
+            # ── C5: Gate+Up merged GEMM ──
+            w_scale_gu = w_scales + (l * 4 + 2) * 4
+            gw_ptr = gw + l * D * H * 2
+            fvk.fp8_gemm_descale_fp16(xn_fp8, gw_ptr, fg, S, H * 2, D,
+                                       act_scale_gu, w_scale_gu, stream)
+
+            # ── C6: SiLU(gate) × up → FP8 ──
+            act_scale_down = act_scales + (step_scale_base + l * 4 + 3) * 4
+            fvk.gate_geglu_merged_fp8_fp16(fg, hid_fp8, S, H, act_scale_down, stream)
+
+            # ── C6: Down GEMM ──
+            w_scale_down = w_scales + (l * 4 + 3) * 4
+            dw_ptr = dw + l * H * D
+            fvk.fp8_gemm_descale_fp16(hid_fp8, dw_ptr, fg, S, D, H,
+                                       act_scale_down, w_scale_down, stream)
+
+            # ── C7→C1_next: gate×residual + next AdaRMSNorm → FP8 ──
+            if l < layers - 1:
+                si_next = (s * layers + l + 1) * S * D3
+                sa_next_ptr = sa + si_next * 2
+                act_scale_next = act_scales + (step_scale_base + (l + 1) * 4 + 0) * 4
+                fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sa_next_ptr,
+                                                      xn_fp8, gate, S, D, act_scale_next, stream)
+            else:
+                fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+
+        # ── Final: AdaRMSNorm + action output ──
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
+
+        _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Decoder NVFP4 path (Thor SM110, exact Pi0.5 business shape)
+# ══════════════════════════════════════════════════════════════════
+
+def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
+                        attn=None, rtc_prefix_len: int = 0):
+    """Pi0.5 action-expert decoder with all four projections in NVFP4.
+
+    This is an explicit Thor-only path. It accepts only the production Pi0.5
+    decoder shape and raises on any missing buffer, weight, or failed CUTLASS
+    launch; it never routes back to FP8.
+    """
+    S = int(dims['S'])
+    D = int(dims['D'])
+    H = int(dims['H'])
+    NH = int(dims['NH'])
+    HD = int(dims['HD'])
+    steps = int(dims['steps'])
+    layers = int(dims['layers'])
+    enc_seq = int(dims['enc_seq'])
+    total_keys = int(dims['total_keys'])
+    shape = (S, D, H, NH, HD, steps, layers)
+    expected = (10, 1024, 4096, 8, 256, 10, 18)
+    if shape != expected:
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 requires shape {expected}, got {shape}")
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
+
+    variants = tuple(int(v) for v in dims['fp4_variants'])
+    if len(variants) != 4 or any(v < 0 for v in variants):
+        raise ValueError(
+            "Pi0.5 Thor decoder FP4 requires four non-negative GEMM variants")
+    variant_qkv, variant_o, variant_gu, variant_down = variants
+    weight_format = str(dims.get('weight_format', 'nvfp4'))
+    act_format = str(dims.get('act_format', 'nvfp4'))
+    rht = 1 if dims.get('rht') else 0
+    fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
+    fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
+    fused_geglu_swap = bool(dims.get('fused_geglu_swap')) and fused_geglu
+    fused_geglu_swap_persist = bool(dims.get('fused_geglu_swap_persist')) and fused_geglu_swap
+    fused_geglu_swap_stages = int(dims.get('fused_geglu_swap_stages') or 0) if fused_geglu_swap else 0
+    fused_geglu_earlyb = int(dims.get('fused_geglu_earlyb') or 0) if fused_geglu else 0
+    act_e0m3 = act_format == 'e0m3'
+    attn_splitkv = (bool(dims.get('attn_splitkv')) and not fixed_shape
+                    and not act_e0m3)
+    attn_mqa = (bool(dims.get('attn_mqa')) and not fixed_shape
+                and not act_e0m3 and not attn_splitkv)
+    attn_tc05 = (bool(dims.get('attn_tc05')) and not fixed_shape
+                 and not act_e0m3 and not attn_splitkv and not attn_mqa)
+    attn_mqa_fp8 = (bool(dims.get('attn_mqa_fp8')) and not fixed_shape
+                    and not act_e0m3 and not attn_splitkv and not attn_mqa and not attn_tc05
+                    and bool(weights.get('Kc8')))
+    attn_mqa_variant = int(dims.get('attn_mqa_variant', 1))
+    attn_decode = int(dims.get('attn_decode') or 0)
+    if attn_decode and (fixed_shape or act_e0m3 or attn_splitkv or attn_mqa or attn_tc05 or attn_mqa_fp8):
+        attn_decode = 0
+    if attn_decode in (2, 4) and not weights.get('Kc8'):
+        raise ValueError("attn_decode 2/4 needs the e4m3 KV cache (Kc8/Vc8)")
+    Kc8 = weights.get('Kc8', 0)
+    Vc8 = weights.get('Vc8', 0)
+    attn_ws = bufs.get('attn_ws', 0)
+    if (attn_splitkv or attn_mqa or attn_tc05 or attn_mqa_fp8 or attn_decode) and not attn_ws:
+        raise ValueError(
+            "Pi0.5 Thor decoder attn_splitkv/attn_mqa requires bufs['attn_ws']")
+    # Persistent GEMM sequence: one launch per layer for O -> AdaRMS -> gate_up
+    # (GeGLU) -> down -> AdaRMS -> next qkv (weights streamed continuously).
+    dec_seq = (bool(dims.get('dec_seq')) and fused_geglu and not act_e0m3
+               and weight_format == 'nvfp4')
+    dec_phase = (bool(dims.get('phase_cta')) and not fixed_shape and not act_e0m3
+                 and not dec_seq)
+    phase_npc = 0 if int(dims.get('phase_cta') or 0) == 2 else (S + 1) // 2 * 2
+    phase_counters = bufs.get('phase_counters', 0)
+    if dec_phase and not phase_counters:
+        raise RuntimeError("Pi0.5 Thor decoder phase_cta requires bufs['phase_counters']")
+    seq_counter = bufs.get('seq_counter', 0)
+    seq_gu_dummy = bufs.get('seq_gu_dummy', 0)
+    seq_partials = bufs.get('seq_partials', 0)
+    seq_slot_packed = bufs.get('seq_slot_packed', 0)
+    seq_slot_sfa = bufs.get('seq_slot_sfa', 0)
+    seq_slots = int(dims.get('dec_seq_slots', 10))
+    seq_variant = int(dims.get("dec_seq_variant", 0))
+    # Side-stream L2 touch of the layer's remaining weights (O, gate_up, down, next qkv) right after
+    # the qkv GEMM, so the attention chain and the small kernels run while DRAM streams the weights
+    # into L2 and the GEMMs find them hot. Off by default; opt-in via dims['dec_l2_touch'] = CTAs.
+    l2_touch = int(dims.get('dec_l2_touch') or 0)
+    l2_touch_hint = int(dims.get('dec_l2_touch_hint', 1))
+    l2_touch_depth = int(dims.get('dec_l2_touch_depth', 16))
+    l2_touch_pace = int(dims.get('dec_l2_touch_pace', 0))
+    l2_touch_ahead = int(dims.get('dec_l2_touch_ahead', 0))
+    l2_touch_threads = int(dims.get('dec_l2_touch_threads', 256))
+    l2_touch_kv = int(dims.get('dec_l2_touch_kv', 0))
+    l2_touch_mask = int(dims.get('dec_l2_touch_mask', 15))
+    l2_touch_sfb = int(dims.get('dec_l2_touch_sfb', 1))
+    l2_touch_fork = int(dims.get('dec_l2_touch_fork', 0))
+    l2_touch_kv_late = int(dims.get('dec_l2_touch_kv_late', 0))
+    action_fused = bool(dims.get('dec_action_fused', 0))
+
+    def l2_touch_regions(s_, l_):
+        # Weight regions (and optionally K/V) of layer l_ of step s_, in consumption order.
+        nb = l2_touch_bytes
+        regs = []
+        if l2_touch_mask & 1:
+            regs += [(weights['qw_fp4'][l_], nb['qw'][0])] + ([(weights['qw_sfb'][l_], nb['qw'][1])] if l2_touch_sfb else [])
+        if l2_touch_kv:
+            kvb = total_keys * HD * 2
+            regs += [(Kc + l_ * kvb, kvb), (Vc + l_ * kvb, kvb)]
+        if l2_touch_mask & 2:
+            regs += [(weights['ow_fp4'][l_], nb['ow'][0])] + ([(weights['ow_sfb'][l_], nb['ow'][1])] if l2_touch_sfb else [])
+        if l2_touch_mask & 4:
+            regs += [(weights['gwil_fp4'][l_], nb['gwil'][0])] + ([(weights['gwil_sfb'][l_], nb['gwil'][1])] if l2_touch_sfb else [])
+        if l2_touch_mask & 8:
+            regs += [(weights['dw_fp4'][l_], nb['dw'][0])] + ([(weights['dw_sfb'][l_], nb['dw'][1])] if l2_touch_sfb else [])
+        return regs
+
+    def l2_touch_launch(regs, where):
+        rc = 0 if not regs else fvk_fp4.l2_touch_fork(
+            regs, stream, l2_touch, l2_touch_hint, l2_touch_sink, l2_touch_depth, l2_touch_pace, l2_touch_threads)
+        if rc != 0:
+            raise RuntimeError(f"Pi0.5 decoder FP4 l2_touch {where} failed rc={rc}")
+    l2_touch_sink = bufs.get('l2_touch_sink', 0)
+    l2_touch_bytes = weights.get('fp4_bytes')
+    if l2_touch and (dec_seq or not fused_geglu or not l2_touch_sink or not l2_touch_bytes):
+        raise ValueError(
+            "Pi0.5 Thor decoder dec_l2_touch requires the fused-GeGLU per-kernel path, "
+            "bufs['l2_touch_sink'] and weights['fp4_bytes']")
+    # Warp-per-row NVFP4 quantize (row kernels v2) for the attention output.
+    dec_rowops_quant = bool(dims.get('dec_rowops_quant', False)) and not act_e0m3
+    dec_rowops_v5 = int(dims.get('rowops_v5', 0) or 0)
+    dec_ares = int(dims.get('dec_ares', 0) or 0)   # bit 0: activation-resident persistent GeGLU GEMM for gate_up
+    if dec_seq and not (seq_counter and seq_gu_dummy and seq_partials
+                        and seq_slot_packed and seq_slot_sfa):
+        raise ValueError(
+            "Pi0.5 Thor decoder dec_seq requires bufs['seq_counter'], "
+            "'seq_gu_dummy', 'seq_partials', 'seq_slot_packed', 'seq_slot_sfa']")
+    if act_format not in ('nvfp4', 'e0m3'):
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
+    if (act_e0m3 or rht) and weight_format != 'e0m3':
+        raise ValueError(
+            "Pi0.5 Thor decoder FP4 E0M3 activations/RHT require "
+            "weight_format='e0m3'")
+    if weight_format == 'e0m3':
+        # Uniform-INT4 weights: route every projection through the
+        # runtime-idesc GEMM (fixed v10 tile); the variant index is unused.
+        a_fmt = 0 if act_e0m3 else 1
+        def dec_gemm(variant, *args):
+            return fvk_fp4.cutlass_fp4_gemm_e0m3w(*args, a_format=a_fmt)
+    elif weight_format == 'nvfp4':
+        dec_gemm = fvk_fp4.cutlass_fp4_gemm_variant
+    else:
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown weight_format {weight_format!r}")
+    for name in ('qw_fp4', 'qw_sfb', 'ow_fp4', 'ow_sfb',
+                 'gw_fp4', 'gw_sfb', 'dw_fp4', 'dw_sfb'):
+        if len(weights[name]) != layers:
+            raise ValueError(
+                f"Pi0.5 Thor decoder FP4 requires {layers} {name} pointers, "
+                f"got {len(weights[name])}")
+
+    D3 = 3 * D
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    noise = bufs['noise']
+    x = bufs['x']
+    xn = bufs['xn']
+    gate = bufs['gate']
+    qkv = bufs['qkv']
+    logits = bufs['logits']
+    attn_out = bufs['attn_out']
+    fg = bufs['fg']
+    action_f32 = bufs.get('action_f32')
+    xn_fp4 = bufs['xn_fp4']
+    xn_sfa = bufs['xn_sfa']
+    ctx_fp4 = bufs['ctx_fp4']
+    ctx_sfa = bufs['ctx_sfa']
+    hid_fp4 = bufs['hid_fp4']
+    hid_sfa = bufs['hid_sfa']
+
+    ain_w = weights['ain_w']
+    ain_b = weights['ain_b']
+    sa = weights['sa']
+    Kc = weights['Kc']
+    Vc = weights['Vc']
+    sf = weights['sf']
+    aow = weights['aow']
+    aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
+    dt = weights.get('dt')
+    fs = weights['fs']
+    rope = weights['rope']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
+
+    for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+        if action_fused:
+            rc = fvk_fp4.pi05_action_in_fp16(noise, ain_w, ain_b, x, S, D, 32, stream)
+            if rc != 0:
+                raise RuntimeError(f"Pi0.5 decoder FP4 action_in step {s} failed rc={rc}")
+        else:
+            fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+            fvk.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            if l == 0:
+                if act_e0m3:
+                    fvk_fp4.pi05_adarms_e0m3_sfa_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                else:
+                    fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+
+            if not dec_seq or l == 0:
+                rc = dec_gemm(
+                    variant_qkv, xn_fp4, xn_sfa,
+                    weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
+                    S, 2560, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
+            if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 0:
+                # Warm the whole next layer (its qkv first) while this layer runs on hot weights.
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l}")
+            elif l2_touch and l2_touch_ahead == 0:
+                nb = l2_touch_bytes
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                regs = [(weights['ow_fp4'][l], nb['ow'][0]), (weights['ow_sfb'][l], nb['ow'][1]),
+                        (weights['gwil_fp4'][l], nb['gwil'][0]), (weights['gwil_sfb'][l], nb['gwil'][1]),
+                        (weights['dw_fp4'][l], nb['dw'][0]), (weights['dw_sfb'][l], nb['dw'][1])]
+                if ln >= 0:
+                    regs += [(weights['qw_fp4'][ln], nb['qw'][0]), (weights['qw_sfb'][ln], nb['qw'][1])]
+                l2_touch_launch(regs, f"layer {l}")
+
+            if attn_tc05:
+                # tcgen05 fused attention: RoPE + KV append + attention + merge + quantize in one launch
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                rc = fvk_fp4.attn_mqa_tc05_fp4out(
+                    qkv, rope, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                    S, enc_seq, NH, HD, 2560, attn_scale, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 tc05 attention layer {l} failed rc={rc}")
+            else:
+                if fixed_shape:
+                    kv_offset = l * total_keys * HD
+                    fvk.qkv_split_rope_kvcache_fp16_devpos(
+                        qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                        S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                else:
+                    kv_offset = l * total_keys * HD + enc_seq * HD
+                    if attn_mqa_fp8 or attn_decode in (2, 4):
+                        rc = fvk_fp4.qkv_split_rope_kvcache_fp16_fp8_vec(
+                            qkv, rope, attn_out, Kc, Vc, Kc8, Vc8,
+                            S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                    else:
+                        rc = fvk.qkv_split_rope_kvcache_fp16_vec(
+                            qkv, rope, attn_out, Kc, Vc,
+                            S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 qkv split layer {l} failed "
+                            f"rc={rc}")
+
+                if attn_splitkv:
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                    rc = fvk_fp4.pi05_dec_attn_splitkv_fp4(
+                        attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 split-KV attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_decode:
+                    # Flash-decoding form: one CTA per 64-key tile, merge + NVFP4 quantize fused.
+                    if attn_decode in (2, 4):
+                        Kd = Kc8 + l * total_keys * HD
+                        Vd = Vc8 + l * total_keys * HD
+                    else:
+                        Kd = Kc + l * total_keys * HD * 2
+                        Vd = Vc + l * total_keys * HD * 2
+                    dec_fn = fvk_fp4.attn_decode_tc05_fp4out if attn_decode >= 3 else fvk_fp4.attn_decode_mqa_fp4out
+                    rc = dec_fn(
+                        attn_out, Kd, Vd, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream, 1 if attn_decode in (2, 4) else 0)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 decode attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_mqa_fp8:
+                    # attn_mqa_s16 over the e4m3 KV cache (half the KV DRAM traffic).
+                    K8_ptr = Kc8 + l * total_keys * HD
+                    V8_ptr = Vc8 + l * total_keys * HD
+                    rc = fvk_fp4.attn_mqa_s16_fp8kv_fp4out(
+                        attn_out, K8_ptr, V8_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream, attn_mqa_variant)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 FP8-KV attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_mqa:
+                    # One kernel: QK^T, softmax, PV over the shared KV head with
+                    # the split merge and the NVFP4 quantize fused (replaces the
+                    # cuBLAS chain + quantize launch).
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                    rc = fvk_fp4.attn_mqa_s16_fp4out(
+                        attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 MQA attention layer {l} "
+                            f"failed rc={rc}")
+                else:
+                    if attn is not None:
+                        attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
+                                 stream=stream)
+                    else:
+                        K_ptr = Kc + l * total_keys * HD * 2
+                        V_ptr = Vc + l * total_keys * HD * 2
+                        fvk.attention_qkv_fp16(
+                            ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
+                            S, total_keys, NH, HD, attn_scale, stream)
+
+                    if act_e0m3:
+                        rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
+                            stream)
+                    elif dec_rowops_quant and (dec_rowops_v5 & 4):
+                        rc = fvk_fp4.rowops_quantize_fp4_sfa_v5(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, stream)
+                    elif dec_rowops_quant:
+                        rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, stream)
+                    else:
+                        rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 O activation layer {l} failed "
+                            f"rc={rc}")
+            if dec_seq:
+                # One persistent launch: O (gated residual into x, row ssq
+                # partials) -> private AdaRMS -> gate_up (GeGLU compact store,
+                # activations from the cluster slots) -> down (gated residual)
+                # -> private AdaRMS -> next layer's qkv. The gate of each
+                # residual add is read straight from the previous AdaRMS
+                # style rows.
+                last = (l == layers - 1)
+                gate_pitch = 3 * D
+                pp = 16 * (D // 2)
+                sp = 128 * (D // 16)
+                none_ph = (0,) * 14
+                none_epi = (0,) * 8
+                probs = [
+                    (ctx_fp4, ctx_sfa, weights['ow_fp4'][l],
+                     weights['ow_sfb'][l], x, S, D, NH * HD, 1.0, 0.0),
+                    (seq_slot_packed, seq_slot_sfa, weights['gwil_fp4'][l],
+                     weights['gwil_sfb'][l], seq_gu_dummy, S, H * 2, D,
+                     1.0, 0.0),
+                    (hid_fp4, hid_sfa, weights['dw_fp4'][l],
+                     weights['dw_sfb'][l], x, S, D, H, 1.0, 0.0),
+                ]
+                phases = [
+                    (3, 0, 0, sf_ptr, 0, 0, 0, S, D, seq_partials,
+                     seq_slot_packed, seq_slot_sfa, pp, sp),
+                    none_ph,
+                ]
+                epi = [
+                    (2, 0, 0, x, sa_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                    (1, hid_fp4, hid_sfa, 0, 0, 0, 0, 0),
+                    (2, 0, 0, x, sf_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                ]
+                bpriv = [(0, 0), (1, seq_slots), (0, 0)]
+                if not last:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    probs.append(
+                        (seq_slot_packed, seq_slot_sfa, weights['qw_fp4'][l + 1],
+                         weights['qw_sfb'][l + 1], qkv, S, 2560, D, 1.0, 0.0))
+                    phases.append(
+                        (3, 0, 0, sa_next_ptr, 0, 0, 0, S, D, seq_partials,
+                         seq_slot_packed, seq_slot_sfa, pp, sp))
+                    phases.append(none_ph)
+                    epi.append(none_epi)
+                    bpriv.append((1, seq_slots))
+                else:
+                    phases.append(none_ph)
+                rc, grid = fvk_fp4.cutlass_fp4_gemm_seq(
+                    probs, seq_counter, stream, seq_variant, 0, phases, epi,
+                    bpriv)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence layer {l} failed rc={rc}")
+                if grid[0] * grid[1] * grid[2] != 2 * seq_slots:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence grid {grid} does not "
+                        f"match {seq_slots} activation slots")
+                continue
+            if dec_phase:
+                # O GEMM whose launch also carries the gated residual + AdaRMS
+                # + quantize (extra CTAs run it once the GEMM CTAs stored), so
+                # gate_up launches at this kernel's trigger.
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    ctx_fp4, ctx_sfa, weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream, phase_counters, 1, phase_npc,
+                    (fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D))
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O+phase layer {l} failed rc={rc}")
+            else:
+                if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 1:
+                    # Fork after the attention chain: its KV-cache cold reads go first, then the pump.
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (post-attn)")
+                rc = dec_gemm(
+                    variant_o, ctx_fp4, ctx_sfa,
+                    weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
+
+                if act_e0m3:
+                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
+                        stream)
+                else:
+                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+            if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 2 and not dec_seq:
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (post-O)")
+            if fused_geglu and not act_e0m3:
+                # One interleaved GeGLU GEMM: the epilogue computes
+                # gelu(gate)*up per column pair and writes the Down input
+                # (hid_fp4/hid_sfa) directly; the gate_up fp16 output and
+                # the GeGLU-quantize kernel disappear.
+                geglu_v10 = (fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10
+                             if fused_geglu_nod
+                             else fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10)
+                if fused_geglu_swap:
+                    # Operand-swapped 2-SM form with the early weight stream.
+                    geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap
+                if fused_geglu_swap_persist:
+                    # ... on the static persistent tile scheduler.
+                    geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist
+                if fused_geglu_swap_stages:
+                    # ... with a smaller mainloop ring so several CTAs share an SM.
+                    def geglu_v10(*a, _st=fused_geglu_swap_stages):
+                        return fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(*a[:-1], _st, a[-1])
+                if dec_ares & 1:
+                    rc = fvk_fp4.pi05_dec_ares_geglu(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        hid_fp4, hid_sfa, S, H * 2, D, stream, 1 | (dec_ares & 2) | (((s * layers + l) & 511) << 8))
+                elif fused_geglu_earlyb and fused_geglu_nod and not fused_geglu_swap:
+                    # v10 tile with the weight k-tiles streamed before the PDL wait.
+                    rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream, fused_geglu_earlyb)
+                else:
+                    rc = geglu_v10(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder fused GeGLU layer {l} failed "
+                        f"rc={rc}")
+            else:
+                rc = dec_gemm(
+                    variant_gu, xn_fp4, xn_sfa,
+                    weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
+                    S, H * 2, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 gate_up layer {l} failed "
+                        f"rc={rc}")
+
+                if act_e0m3:
+                    rc = fvk_fp4.gate_geglu_e0m3_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, rht, stream)
+                else:
+                    rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
+            if dec_phase:
+                # down GEMM + (next layer's) gated residual + AdaRMS + quantize
+                # in one launch; the last layer carries the plain gated residual.
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    ph = (1, (fg, gate, x, sa_next_ptr, xn_fp4, xn_sfa, gate, S, D))
+                else:
+                    ph = (2, (fg, gate, x, 0, 0, 0, 0, S, D))
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    hid_fp4, hid_sfa, weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream, phase_counters + 16, ph[0], phase_npc,
+                    ph[1])
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down+phase layer {l} failed rc={rc}")
+            else:
+                if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 3:
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (pre-down)")
+                if l2_touch and l2_touch_kv_late:
+                    # KV cache of the next layer alone, late: after the weight stream, before the down GEMM.
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    if ln >= 0:
+                        kvb = total_keys * HD * 2
+                        l2_touch_launch([(Kc + ln * kvb, kvb), (Vc + ln * kvb, kvb)], f"layer {l} (kv late)")
+                rc = dec_gemm(
+                    variant_down, hid_fp4, hid_sfa,
+                    weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
+                if l2_touch and l2_touch_ahead == 2:
+                    # Two layers ahead, forked once this layer's weights are consumed: the side
+                    # stream never idles and at most two layers of weights are in flight in L2.
+                    if l + 2 < layers:
+                        ln, sn = l + 2, s
+                    elif s + 1 < steps:
+                        ln, sn = l + 2 - layers, s + 1
+                    else:
+                        ln, sn = -1, s
+                    if s == 0 and l == 0:
+                        # frame start: layer 1 has nobody to warm it
+                        l2_touch_launch(l2_touch_regions(0, 1), "layer 1 (frame start)")
+                    l2_touch_launch(l2_touch_regions(sn, ln) if ln >= 0 else [], f"layer {l} (+2)")
+
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    if act_e0m3:
+                        fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                    else:
+                        fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, stream)
+                else:
+                    fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        if action_fused and dt is not None and action_f32 is not None:
+            rc = fvk_fp4.pi05_adarms_action_out_fp16(
+                x, fs_ptr, xn, gate, aow, aob, noise, S, D, 32, float(dt), stream)
+            if rc != 0:
+                raise RuntimeError(f"Pi0.5 decoder FP4 action_out step {s} failed rc={rc}")
+        else:
+            fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
+            _action_update_fp16(
+                ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+    if l2_touch:
+        rc = fvk_fp4.l2_touch_join(stream)
+        if rc != 0:
+            raise RuntimeError(f"Pi0.5 decoder FP4 l2_touch join failed rc={rc}")
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# FP16 decoder path (no quantization, FP16 weights, baseline only)
+# ══════════════════════════════════════════════════════════════════
+
+def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *,
+                          attn=None, rtc_prefix_len: int = 0):
+    """FP16-only decoder forward. Structure mirrors the FP8 path; every
+    GEMM is ``fvk.gmm_fp16`` and the fused FP8 norm kernels are split.
+
+    Weight pointers (``qw/ow/gw/dw``) must reference FP16 [K,N] tensors
+    (NN layout — same as the FP8 layout, just unquantized; see the
+    ``use_fp8=False`` weight spec).
+    """
+    S = dims['S']; D = dims['D']; H = dims['H']
+    NH = dims['NH']; HD = dims['HD']
+    steps = dims['steps']; layers = dims['layers']
+    enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
+    D3 = 3 * D
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
+    gate = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
+    attn_out = bufs['attn_out']; fg = bufs['fg']; hid = bufs['hid']
+    action_f32 = bufs.get('action_f32')
+
+    ain_w = weights['ain_w']; ain_b = weights['ain_b']
+    sa = weights['sa']; qw = weights['qw']
+    Kc = weights['Kc']; Vc = weights['Vc']
+    ow = weights['ow']; sf = weights['sf']
+    gw = weights['gw']; dw = weights['dw']
+    aow = weights['aow']; aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
+    dt = weights.get('dt')
+    fs = weights['fs']; rope = weights['rope']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
+
+    for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            # C1: AdaRMSNorm (FP16, no FP8 quantize)
+            fvk.adarms_fp16(x, sa_ptr, xn, gate, S, D, stream)
+
+            # C2: QKV GEMM (FP16 NN; weight is [K, 2560])
+            qw_ptr = qw + l * D * 2560 * 2  # FP16 = 2 bytes/elem
+            fvk.gmm_fp16(ctx, xn, qw_ptr, qkv, S, 2560, D, 0.0, stream)
+
+            # C2b: Split + RoPE + KV cache write
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, K_dim, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                 S, Q_dim, K_dim, HD, 2560,
+                                                 kv_offset, HD, stream)
+
+            # C3: Attention
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                                        logits, attn_out,
+                                        S, total_keys, NH, HD, attn_scale, stream)
+
+            # C4: O proj
+            ow_ptr = ow + l * NH * HD * D * 2  # FP16
+            fvk.gmm_fp16(ctx, attn_out, ow_ptr, fg, S, D, NH * HD, 0.0, stream)
+
+            # C4→C5: gated residual + post-attn AdaRMSNorm
+            fvk.mul_fp16(fg, gate, fg, S * D, stream)
+            fvk.residual_add_fp16(x, fg, S * D, stream)
+            fvk.adarms_fp16(x, sf_ptr, xn, gate, S, D, stream)
+
+            # C5: Gate+Up merged GEMM (weight is [K, 2H])
+            gw_ptr = gw + l * D * H * 2 * 2  # FP16 = 2 bytes/elem; weight has 2H cols
+            fvk.gmm_fp16(ctx, xn, gw_ptr, fg, S, H * 2, D, 0.0, stream)
+
+            # C6: GELU(gate) × up (FP16)
+            fvk.gate_geglu_merged_fp16(fg, hid, S, H, stream)
+
+            # C6: Down GEMM (weight is [H, D])
+            dw_ptr = dw + l * H * D * 2  # FP16
+            fvk.gmm_fp16(ctx, hid, dw_ptr, fg, S, D, H, 0.0, stream)
+
+            # C7: residual into x (next layer's C1 will do AdaRMS)
+            fvk.mul_fp16(fg, gate, fg, S * D, stream)
+            fvk.residual_add_fp16(x, fg, S * D, stream)
+
+        # Final: AdaRMSNorm + action output
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
+        _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Calibration (framework-agnostic, pure pointer ops)
+# ══════════════════════════════════════════════════════════════════
+
+def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
+                               calib_scales_ptr, stream=0, *, attn=None):
+    """Calibrate decoder FP8 scales. Framework-agnostic (pure pointers).
+
+    For each quantization point:
+      1. FP16 kernel → measure amax on GPU
+      2. FP8 kernel with that scale
+    """
+    S = dims['S']; D = dims['D']; H = dims['H']
+    NH = dims['NH']; HD = dims['HD']
+    steps = dims['steps']; layers = dims['layers']
+    enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
+    Q_dim = NH * HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+    D3 = 3 * D
+
+    noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
+    gate_buf = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
+    attn_out = bufs['attn_out']; hid = bufs['hid']; fg = bufs['fg']
+    action_f32 = bufs.get('action_f32')
+    xn_fp8 = bufs['xn_fp8']; hid_fp8 = bufs['hid_fp8']; ctx_fp8 = bufs['ctx_fp8']
+
+    ain_w = weights['ain_w']; ain_b = weights['ain_b']
+    sa = weights['sa']; qw = weights['qw']
+    Kc = weights['Kc']; Vc = weights['Vc']
+    ow = weights['ow']; sf = weights['sf']
+    gw = weights['gw']; dw = weights['dw']
+    aow = weights['aow']; aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
+    dt = weights.get('dt')
+    fs = weights['fs']; rope = weights['rope']
+    w_scales = weights['w_scales']
+
+    # Scratch buffers — provided by caller via bufs dict
+    calib_buf = bufs['calib_buf']          # layers*4 float32
+    d_scale = bufs['d_scale']              # 1 float32
+    hidden_scratch = bufs['hidden_scratch']  # S*H fp16
+    fp8_scratch = bufs['fp8_scratch']      # S*max(D,H) fp8
+    _gpu_zero(calib_buf, steps * layers * 4 * 4, stream)
+
+    for s in range(steps):
+        step_scale_base = s * layers * 4
+        fvk_mod.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk_mod.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            # C1: AdaRMSNorm FP16 → measure amax → FP8
+            cs_qkv = calib_buf + (step_scale_base + l * 4 + 0) * 4
+            if l == 0:
+                fvk_mod.adarms_fp16(x, sa_ptr, xn, gate_buf, S, D, stream)
+                _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
+                _gpu_sync(stream)
+                _gpu_copy(cs_qkv, d_scale, 4, stream)
+                fvk_mod.fused_adarms_fp8_static_fp16(
+                    x, sa_ptr, xn_fp8, gate_buf, S, D, cs_qkv, stream)
+
+            # C2: QKV GEMM
+            ws_qkv = w_scales + (l * 4 + 0) * 4
+            qw_ptr = qw + l * D * 2560
+            fvk_mod.fp8_gemm_descale_fp16(xn_fp8, qw_ptr, qkv, S, 2560, D,
+                                           cs_qkv, ws_qkv, stream)
+
+            # C2b: Split+RoPE
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk_mod.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, HD, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk_mod.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                      S, Q_dim, HD, HD, 2560,
+                                                      kv_offset, HD, stream)
+
+            # C3: Attention
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk_mod.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                                            logits, attn_out,
+                                            S, total_keys, NH, HD, attn_scale, stream)
+
+            # C4: O proj — measure attn amax → FP8 → GEMM
+            _measure_scale_gpu(fvk_mod, attn_out, S * NH * HD, d_scale, fp8_scratch, stream)
+            _gpu_sync(stream)
+            cs_o = calib_buf + (step_scale_base + l * 4 + 1) * 4
+            _gpu_copy(cs_o, d_scale, 4, stream)
+            ws_o = w_scales + (l * 4 + 1) * 4
+            fvk_mod.quantize_fp8_static_fp16(attn_out, ctx_fp8, cs_o, S * NH * HD, stream)
+            ow_ptr = ow + l * NH * HD * D
+            fvk_mod.fp8_gemm_descale_fp16(ctx_fp8, ow_ptr, fg, S, D, NH * HD,
+                                           cs_o, ws_o, stream)
+
+            # C4→C5: gate×residual + AdaRMSNorm → measure → FP8
+            fvk_mod.gate_res_fp16(fg, gate_buf, x, S * D, stream)
+            fvk_mod.adarms_fp16(x, sf_ptr, xn, gate_buf, S, D, stream)
+            _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
+            _gpu_sync(stream)
+            cs_gu = calib_buf + (step_scale_base + l * 4 + 2) * 4
+            _gpu_copy(cs_gu, d_scale, 4, stream)
+            fvk_mod.quantize_fp8_static_fp16(xn, xn_fp8, cs_gu, S * D, stream)
+
+            # C5: Gate+Up GEMM
+            ws_gu = w_scales + (l * 4 + 2) * 4
+            gw_ptr = gw + l * D * H * 2
+            fvk_mod.fp8_gemm_descale_fp16(xn_fp8, gw_ptr, fg, S, H * 2, D,
+                                           cs_gu, ws_gu, stream)
+
+            # C6: GELU → measure → FP8
+            fvk_mod.gate_geglu_merged_fp16(fg, hidden_scratch, S, H, stream)
+            _measure_scale_gpu(fvk_mod, hidden_scratch, S * H, d_scale, fp8_scratch, stream)
+            _gpu_sync(stream)
+            cs_down = calib_buf + (step_scale_base + l * 4 + 3) * 4
+            _gpu_copy(cs_down, d_scale, 4, stream)
+            fvk_mod.gate_geglu_merged_fp8_fp16(fg, hid_fp8, S, H, cs_down, stream)
+
+            # C6: Down GEMM
+            ws_down = w_scales + (l * 4 + 3) * 4
+            dw_ptr = dw + l * H * D
+            fvk_mod.fp8_gemm_descale_fp16(hid_fp8, dw_ptr, fg, S, D, H,
+                                           cs_down, ws_down, stream)
+
+            # C7: gate×residual + next layer prep
+            if l < layers - 1:
+                si_next = (s * layers + l + 1) * S * D3
+                sa_next_ptr = sa + si_next * 2
+                fvk_mod.gate_res_fp16(fg, gate_buf, x, S * D, stream)
+                fvk_mod.adarms_fp16(x, sa_next_ptr, xn, gate_buf, S, D, stream)
+                _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
+                _gpu_sync(stream)
+                cs_next = calib_buf + (step_scale_base + (l + 1) * 4 + 0) * 4
+                _gpu_copy(cs_next, d_scale, 4, stream)
+                fvk_mod.quantize_fp8_static_fp16(xn, xn_fp8, cs_next, S * D, stream)
+            else:
+                fvk_mod.gate_res_fp16(fg, gate_buf, x, S * D, stream)
+
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        fvk_mod.adarms_fp16(x, fs_ptr, xn, gate_buf, S, D, stream)
+        _action_update_fp16(ctx, fvk_mod, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32, aob_dt)
+
+    _gpu_copy(calib_scales_ptr, calib_buf, steps * layers * 4 * 4, stream)
+    _gpu_sync(stream)
+
+
+
+class Pi05ThorPipeline:
+    """Pi0.5 Thor SM110 inference pipeline base class (B=1).
+
+    The Thor frontend owns all device buffers and captures the
+    SigLIP + enc_ae CUDA graphs at B=1 shape. This class is a thin
+    facade that exposes :meth:`run_pipeline` for orchestration, so the
+    serial CFG and (Stage 2) batched subclasses can share the same
+    contract.
+
+    Args:
+        batch_size: Hard contract — B=1 for the base class. Stage 2's
+            :class:`Pi05ThorBatchedPipeline` accepts ``batch_size >= 1``
+            and is the path to use for actual B>1 inference.
+
+    Notes:
+        * **No buffer ownership**: lifetime of all device buffers
+          stays with the frontend. The pipeline never alloc/frees.
+        * **No graph capture**: capture is the frontend's
+          responsibility (it is intertwined with calibration). The
+          pipeline only orchestrates ``replay``.
+        * **Backend-agnostic**: backend-specific graph objects stay
+          in the frontend and are wrapped by the ``replay_siglip`` /
+          ``replay_enc_ae`` callbacks handed in here. Each callback is
+          responsible for any stream-sync the backend needs after replay.
+    """
+
+    def __init__(self, *, batch_size: int = 1):
+        if batch_size != 1:
+            raise ValueError(
+                f"Pi05ThorPipeline base class supports only B=1; got "
+                f"B={batch_size}. Use Pi05ThorBatchedPipeline for B>1.")
+        self.batch_size = int(batch_size)
+        self._runtime_owner = None
+
+    def run_pipeline(self, *, replay_siglip, replay_enc_ae) -> None:
+        """Replay the captured SigLIP graph followed by enc_ae graph.
+
+        Args:
+            replay_siglip: Callable ``() -> None`` that replays the
+                frontend's captured SigLIP graph. Must include any
+                stream synchronization the frontend's backend needs.
+            replay_enc_ae: Callable ``() -> None`` for the encoder +
+                decoder graph, same conventions.
+        """
+        replay_siglip()
+        replay_enc_ae()
+
+    def bind_runtime_owner(self, owner: object) -> None:
+        """Attach the frontend that owns Thor buffers and graph capture."""
+        self._runtime_owner = owner
+
+    def bind_runtime_export(
+            self, *, graph: object, graph_stream: object, bufs: dict,
+            decoder_only_graph: object | None = None,
+            num_views: int, max_prompt_len: int, chunk_size: int,
+            norm_stats=None, use_fp8: bool = True,
+            tensor_dtype: str = "f16", hardware: str = "thor_sm110") -> None:
+        """Bind the standard Pi0.5 runtime-export surface.
+
+        Thor frontends own the actual storage/capture. This facade exposes the
+        same producer attributes as the RTX pipeline so the shared
+        ``runtime_export.py`` contract can lower either hardware path without
+        hardware branches in C++ or Nexus.
+        """
+        self._graph = graph
+        self._decoder_only_graph = decoder_only_graph
+        self._graph_stream = graph_stream
+        self.bufs = dict(bufs)
+        self.num_views = int(num_views)
+        self.max_prompt_len = int(max_prompt_len)
+        self.chunk_size = int(chunk_size)
+        self.norm_stats = norm_stats or {}
+        self.use_fp8 = bool(use_fp8)
+        self.use_int8_decoder = False
+        self.tensor_dtype = str(tensor_dtype)
+        self.hardware = str(hardware)
+        self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.subgraphs.capture import run_capture_hooks
+        run_capture_hooks(
+            self, self._graph_stream,
+            int(getattr(self._graph_stream, "value", self._graph_stream) or 0))
+
+    def _ensure_runtime_export_ready(self) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is not None and hasattr(owner, "_ensure_model_runtime_export"):
+            owner._ensure_model_runtime_export()
+        if getattr(self, "_graph", None) is None:
+            raise RuntimeError(
+                "Pi05 Thor runtime export requires a captured full graph; "
+                "call set_prompt()/predict() before export")
+
+    @property
+    def input_images_buf(self):
+        return self.bufs["observation_images_normalized"]
+
+    @property
+    def input_noise_buf(self):
+        return self.bufs["diffusion_noise"]
+
+    @property
+    def input_encoder_x_buf(self):
+        return self.bufs["encoder_x"]
+
+    @property
+    def input_rtc_prev_action_chunk_buf(self):
+        return self.bufs["rtc_prev_action_chunk"]
+
+    @property
+    def input_rtc_prefix_weights_buf(self):
+        return self.bufs["rtc_prefix_weights"]
+
+    @property
+    def input_rtc_guidance_weight_buf(self):
+        return self.bufs["rtc_guidance_weight"]
+
+    def capture_context_action_graphs(self, stream_handle, stream_int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_context_action_graphs"):
+            raise RuntimeError("Pi05 Thor owner cannot capture context_action")
+        owner._capture_model_runtime_context_action_graphs(
+            self, stream_handle, stream_int)
+
+    def capture_rtc_prefix_graph(self, stream_handle, stream_int,
+                                 prefix_len: int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_rtc_prefix_graph"):
+            raise RuntimeError("Pi05 Thor owner cannot capture rtc_prefix")
+        owner._capture_model_runtime_rtc_prefix_graph(
+            self, stream_handle, stream_int, prefix_len)
+
+    def forward(self) -> int:
+        self._ensure_runtime_export_ready()
+        if getattr(self, "_use_exec", False):
+            rc = self._exec_full.replay(0, self._exec_gs_id)
+            if rc != 0:
+                raise RuntimeError(f"frt pi05 thor infer replay rc={rc}")
+        else:
+            self._graph.replay(self._graph_stream)
+        self._cudart.cudaStreamSynchronize(self._graph_stream)
+        return self.bufs["diffusion_noise"].ptr.value
+
+    def export_runtime(self, identity=None, extra_regions=None):
+        """Package the captured Thor pipeline as ``frt_runtime_export_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_runtime
+        return export_runtime(self, identity=identity,
+                              extra_regions=extra_regions)
+
+    def export_model_runtime(self, identity=None, extra_regions=None,
+                             stage_plan="full", io="python",
+                             stage_plan_kwargs=None, robot_action_dim=None,
+                             state_dim=None, native_overlay=None):
+        """Package the captured Thor pipeline as ``frt_model_runtime_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_model_runtime
+        return export_model_runtime(self, identity=identity,
+                                    extra_regions=extra_regions,
+                                    stage_plan=stage_plan, io=io,
+                                    stage_plan_kwargs=stage_plan_kwargs,
+                                    robot_action_dim=robot_action_dim,
+                                    state_dim=state_dim,
+                                    native_overlay=native_overlay)

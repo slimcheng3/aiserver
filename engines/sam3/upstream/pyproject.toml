@@ -18,6 +18,9 @@ dependencies = [
   "typing_extensions",
   "huggingface_hub",
   "pycocotools",
+  "einops",
+  "pillow",
+  "psutil",
 ]
 
 [tool.setuptools.packages.find]

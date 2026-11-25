@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# 昇腾 FlashRT。在有 CANN + torch_npu 的构建机上编，默认 Ascend910B4。
+# 用 AISERVER_FLASHRT_NPU_BASE 指定带 CANN 的底包。
+
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+ARG SOC_VERSION=Ascend910B4
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    WEIGHTS_PATH=/weights/checkpoint \
+    PORT=8000 \
+    ASCEND_SOC_VERSION=${SOC_VERSION} \
+    PYTHONPATH=/opt/flashrt
+
+WORKDIR /opt/flashrt
+COPY upstream /opt/flashrt
+
+RUN bash scripts/npu/build.sh \
+    && python3 -m pip install --no-cache-dir --no-build-isolation -e . \
+    && python3 -m pip install --no-cache-dir "msgpack>=1.0.5" "websockets>=12" "numpy"
+
+WORKDIR /opt/engine
+COPY --from=common runtime_loader.py /opt/engine/runtime_loader.py
+COPY serve.py /opt/engine/serve.py
+
+EXPOSE 8000
+CMD ["python3", "serve.py"]

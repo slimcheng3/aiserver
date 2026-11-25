@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-rt"
+version = "0.2.0"
+description = "FlashRT — realtime CUDA inference engine for small-batch, latency-sensitive AI workloads. Ships VLA frontends for Pi0, Pi0.5, Pi0-FAST, GROOT N1.6/N1.7."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+# Every interpreter listed below is qualified by a clean-room install of
+# this wheel, not by intent: see release_qual/S2-import-py3*.
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+torch = ["torch", "safetensors", "sentencepiece"]
+flint = ["flash-rt[torch]", "tokenizers>=0.21", "jinja2>=3.1"]
+apple = ["torch>=2.5", "safetensors", "sentencepiece"]
+# X-VLA RTX frontend: the BART tokenizer (facebook/bart-large) is loaded
+# lazily by set_prompt; the kernel path itself needs only torch/safetensors.
+xvla = ["torch", "safetensors", "transformers>=4.43"]
+chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
+# LaWAM (LeRobot lawam-pretrain-lerobot) on RTX SM120: torch + safetensors
+# weights, the Qwen3-VL processor at set_prompt time, and PIL frames for it.
+lawam = ["flash-rt[torch]", "transformers>=4.57", "Pillow"]
+# MolmoAct2 prompt tokenizer and BF16 precomputation/noise conversion.
+molmoact2 = ["flash-rt[torch]", "tokenizers>=0.21", "ml_dtypes"]
+# VLA-JEPA (LeRobot) uses the Qwen3-VL AutoProcessor at set_prompt time.
+vla_jepa = ["flash-rt[torch]", "transformers>=4.57"]
+jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
+server = ["fastapi", "uvicorn"]
+eval = ["opencv-python", "tqdm"]
+# Motus RTX FP8 uses a cuBLASLt shape that is unsupported by CUDA 13.0.
+# The frontend preloads this wheel before flash_rt_kernels so it also works
+# when the extension was built on a machine whose toolkit RUNPATH is older.
+motus = ["nvidia-cublas>=13.1,<14"]
+# MiniMax-Remover NVFP4 video-inpainting pipeline. Optional: only needed to
+# construct/run flash_rt.models.minimax_remover (importing the package needs
+# none of these). diffusers + einops are the runtime model deps; scipy is used
+# by the quickstart mask helpers; sageattention is the default attention backend
+# (FLASHRT_ATTN_MODE=sage_fp8) -- switch to FLASHRT_ATTN_MODE=fa2 to drop it.
+# triton ships with torch on CUDA.
+minimax-remover = ["diffusers", "einops", "scipy", "sageattention"]
+# Optional. Required only for the legacy upstream attention path
+# (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7
+# backend. Default RTX Pi0 / Pi0.5 inference uses the vendored
+# flash_rt_fa2.so and does NOT need this. If pip cannot find a
+# prebuilt wheel for your torch+CUDA+Python combo, grab one from
+# https://github.com/Dao-AILab/flash-attention/releases — building
+# the sdist takes 30+ minutes on cold cloud images.
+flash-attn = ["flash-attn"]
+# Thor-only optional fast path: FlashAttention-4 (CuTe-DSL) denoise/prefix
+# attention for LingBot-VLA on Thor (sm_110). The forward / SM100-only source
+# is vendored (privately, as `flashrt_fa4`) at csrc/attention/flash_attn_4_src
+# (no flash-attn wheel needed); these are its runtime deps. Without them,
+# LingBot silently falls back to the fmha path (correct, ~+18ms@25). The loader
+# (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
+# Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
+thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
+all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus,chameleon,xvla,vla_jepa]"]
+
+[project.urls]
+Homepage = "https://github.com/flashrt-project/FlashRT"
+Repository = "https://github.com/flashrt-project/FlashRT"
+Issues = "https://github.com/flashrt-project/FlashRT/issues"
+
+[tool.setuptools.packages.find]
+include = ["flash_rt*"]
+# flash_rt.tests ships with the repo, not with the wheel: the
+# distribution gate is zero test files in what a user installs.
+exclude = ["flash_rt.tests*"]
+
+[tool.setuptools.package-data]
+# Recursive. Structure specs, per-host bindings and tokenizer models live
+# in subdirectories, several of which are data directories rather than
+# packages; a non-recursive glob ships none of them. Kernel sources ship
+# so the CUDA extensions can be built from an installed tree.
+#
+# No ``*.so``: this distribution carries no compiled artifact. Kernels are
+# built locally (see README).
+flash_rt = [
+    "**/*.yaml", "**/*.model", "**/*.json",
+    "**/*.cu", "**/*.cuh", "**/*.cpp", "**/*.h",
+    "py.typed",
+]

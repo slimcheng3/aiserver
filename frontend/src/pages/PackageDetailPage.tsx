@@ -3,8 +3,19 @@ import { api } from "../api";
 import { flow, formatBytes, formatTime, protocolLabel, sourceLabel } from "../format";
 import type { PackageView } from "../types";
 
+function parseHostPort(raw: string): number | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+  const port = Number(text);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("宿主机端口要填 1 到 65535 的整数，留空则自动分配");
+  }
+  return port;
+}
+
 export function PackageDetailPage({ id }: { id: string }) {
   const [item, setItem] = useState<PackageView | null>(null);
+  const [hostPort, setHostPort] = useState("");
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
 
@@ -29,11 +40,11 @@ export function PackageDetailPage({ id }: { id: string }) {
     location.hash = "#/packages";
   }
 
-  async function deploy(target: "local" | "edge") {
+  async function deploy() {
     setError("");
     try {
-      await api.deploy(id, target);
-      location.hash = `#/runtime?package=${id}`;
+      await api.deploy(id, parseHostPort(hostPort));
+      location.hash = `#/test?package=${id}`;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "部署失败");
     }
@@ -84,19 +95,26 @@ export function PackageDetailPage({ id }: { id: string }) {
         </div>
       </div>
       <section className="section">
-        <h2 className="section-title">部署到本机或边侧</h2>
-        <p className="hint">目标可以是这台机体，也可以是边侧。两边都使用已经构建好的镜像。本机挂载清单里的路径；边侧要求权重已经是 S3 地址，并且不在本机启动容器。</p>
+        <h2 className="section-title">部署到本机</h2>
+        <p className="hint">在这台机体上启动容器，挂载清单里的本机路径。使用已经构建好的镜像，部署时不再构建。宿主机端口可指定，留空则自动分配。</p>
         <ul className="check-list">
           <li>运行时镜像 {manifest.engine.image} 需要已经构建，部署时不再构建</li>
           <li>参数 {manifest.weights.map((weight) => weight.name).join("、") || "未绑定"} 留在原处</li>
-          <li>容器内端口 {manifest.engine.port} 会映射到宿主机的一个空闲端口，调用直接连那里</li>
+          <li>容器内端口 {manifest.engine.port} 映射到宿主机端口；填写端口则使用该端口，留空则自动分配</li>
         </ul>
         <div className="toolbar">
-          <button type="button" className="btn primary" onClick={() => void deploy("local")}>
+          <label className="field" style={{ minWidth: 140 }}>
+            <span>端口号</span>
+            <input
+              className="input port-input"
+              inputMode="numeric"
+              placeholder="自动"
+              value={hostPort}
+              onChange={(event) => setHostPort(event.target.value)}
+            />
+          </label>
+          <button type="button" className="btn primary" onClick={() => void deploy()}>
             部署到本机
-          </button>
-          <button type="button" className="btn" onClick={() => void deploy("edge")}>
-            部署到边侧
           </button>
         </div>
       </section>
@@ -159,8 +177,8 @@ export function PackageDetailPage({ id }: { id: string }) {
             ))}
           </tbody>
         </table>
-        {manifest.weights.some((weight) => weight.source === "local" || weight.source === "upload") && (
-          <p className="warn">本机路径只在这台机体上有效。部署到边侧时改用 S3 地址。</p>
+        {manifest.weights.some((weight) => weight.source === "s3") && (
+          <p className="warn">S3 地址不能挂进本机容器。部署请改用本机路径或上传的权重。</p>
         )}
       </section>
       {Object.keys(manifest.engine.env).length > 0 && (

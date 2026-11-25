@@ -63,8 +63,8 @@ models:
       - role: checkpoint
         label: 位姿权重
         required: true
-        prefer: file
-        hint: GenPose2 主权重
+        prefer: directory
+        hint: 含 ScoreNet、EnergyNet、ScaleNet 三个 pth 的目录
       - role: cad
         label: CAD / 先验
         required: false
@@ -115,8 +115,8 @@ models:
     engine:
       image: local/vllm-engine:latest
       codeRef: engines/vllm
-      command: ["python", "serve.py"]
-      port: 8082
+      command: ["--model", "/weights/checkpoint", "--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "0.5"]
+      port: 8000
       healthPath: /health
       protocol: http
       models: [qwen]

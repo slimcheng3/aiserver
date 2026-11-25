@@ -142,12 +142,14 @@ export interface RuntimeInfo {
   models: string[];
   weightQuants: QuantType[];
   baseImage: string;
+  note?: string;
   createdAt: string;
 }
 
 export interface BuildJob {
   id: string;
   image: string;
+  action?: "pull";
   status: "queued" | "running" | "ready" | "failed";
   logs: string[];
   createdAt: string;
@@ -157,7 +159,7 @@ export interface BuildJob {
 export interface Deployment {
   packageId: string;
   name: string;
-  target: "local" | "edge";
+  target: "local";
   status: "running" | "prepared" | "stopped" | "failed";
   image: string;
   protocol: Protocol | string;
@@ -181,6 +183,7 @@ export interface EngineForm {
   image: string;
   codeRef: string;
   command: string;
+  commandExtra: string;
   port: number;
   healthPath: string;
   protocol: Protocol;

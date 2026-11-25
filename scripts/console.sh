@@ -164,6 +164,46 @@ cmd_status() {
   listening 5173 && echo "页面 http://127.0.0.1:5173"
 }
 
+file_hash() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+ensure_deps() {
+  local py="$ROOT/.venv/bin/python"
+  local req="$ROOT/backend/requirements.txt"
+  local req_stamp="$ROOT/.venv/.aiserver-requirements.sha256"
+  if [[ ! -x "$py" ]]; then
+    if [[ -d "$ROOT/.venv" ]]; then
+      echo "虚拟环境不完整。删掉 .venv 后再执行 scripts/console.sh start"
+      return 1
+    fi
+    echo "创建虚拟环境"
+    python3 -m venv "$ROOT/.venv"
+  fi
+  local req_hash
+  req_hash=$(file_hash "$req")
+  if [[ -f "$req_stamp" && "$(<"$req_stamp")" == "$req_hash" ]]; then
+    echo "Python 依赖已安装，跳过"
+  else
+    echo "安装 Python 依赖"
+    "$py" -m pip install -r "$req"
+    printf '%s\n' "$req_hash" >"$req_stamp"
+  fi
+
+  local lock="$ROOT/frontend/package-lock.json"
+  [[ -f "$lock" ]] || lock="$ROOT/frontend/package.json"
+  local npm_stamp="$ROOT/frontend/node_modules/.aiserver-npm.sha256"
+  local npm_hash
+  npm_hash=$(file_hash "$lock")
+  if [[ -d "$ROOT/frontend/node_modules" && -f "$npm_stamp" && "$(<"$npm_stamp")" == "$npm_hash" ]]; then
+    echo "前端依赖已安装，跳过"
+  else
+    echo "安装前端依赖"
+    npm install --prefix "$ROOT/frontend"
+    printf '%s\n' "$npm_hash" >"$npm_stamp"
+  fi
+}
+
 wait_url() {
   local url=$1
   python3 -c 'import sys,time,urllib.request
@@ -180,8 +220,6 @@ raise SystemExit(1)' "$url"
 
 cmd_start() {
   prepare_path
-  ensure_docker_group
-  python3 "$ROOT/scripts/check_env.py" --ready
   local api web
   api=$(repo_pids api || true)
   web=$(repo_pids web || true)
@@ -193,6 +231,10 @@ cmd_start() {
     echo "接口或页面只起来了一部分，或端口被占用。先执行 scripts/console.sh stop"
     return 1
   fi
+  ensure_docker_group
+  python3 "$ROOT/scripts/check_env.py"
+  ensure_deps
+  python3 "$ROOT/scripts/check_env.py" --ready
   mkdir -p "$RUN"
   cd "$ROOT"
   setsid "$ROOT/.venv/bin/python" -m uvicorn app.main:app \

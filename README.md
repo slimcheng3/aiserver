@@ -6,20 +6,20 @@
 
 ## 运行
 
-```powershell
-python -m pip install -r backend\requirements.txt
-python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8787 --reload
+在仓库根目录执行下面的命令。它会先检查环境，再安装还没有的依赖，然后在后台启动。服务已经在运行时直接返回，不会重新安装，也不会再启动一份。服务没在运行时，虚拟环境在就不再创建；依赖清单没变就跳过安装，变了才重新安装。上次执行中断的话，再执行只会补上没完成的那一步。
+
+```bash
+scripts/console.sh start
 ```
 
-另一个终端：
+查看状态和停止：
 
-```powershell
-cd frontend
-npm install
-npm run dev
+```bash
+scripts/console.sh status
+scripts/console.sh stop
 ```
 
-打开 http://127.0.0.1:5173 。接口文档在 http://127.0.0.1:8787/docs 。
+页面是 http://127.0.0.1:5173 ，接口是 http://127.0.0.1:8787 ，接口文档在 http://127.0.0.1:8787/docs 。日志在 `data/run/api.log` 和 `data/run/web.log`。当前用户没有 docker 权限时，启动脚本会用 `sg docker` 再执行一次。
 
 ## 要改的地方
 

@@ -100,6 +100,28 @@ def check_requirements(text: str) -> str:
     return ("\n".join(kept) + "\n") if kept else ""
 
 
+def machine_hardware() -> str:
+    """本机加速器。有 NVIDIA 时按英伟达；只有昇腾时按昇腾。都没有时构建仍走 CUDA。"""
+    from app.images import detect_flashrt_target
+
+    backend, _arch = detect_flashrt_target()
+    return "ascend" if backend == "npu" else "nvidia"
+
+
+def _resolve_hardware(value: str) -> str:
+    if value == "auto":
+        return machine_hardware()
+    if value == "ascend":
+        return "ascend"
+    return "nvidia"
+
+
+def _stamp_hardware(record: dict) -> dict:
+    stamped = dict(record)
+    stamped["hardware"] = _resolve_hardware(str(record.get("hardware") or "nvidia"))
+    return stamped
+
+
 def _builtin(model) -> dict:
     engine = model.engine
     return {
@@ -107,6 +129,7 @@ def _builtin(model) -> dict:
         "name": engine.image,
         "image": engine.image,
         "kind": "builtin",
+        "hardware": engine.hardware,
         "codeRef": engine.codeRef,
         "command": list(engine.command),
         "port": engine.port,
@@ -126,6 +149,7 @@ def _builtin_base() -> dict:
         "name": BASE_IMAGE,
         "image": BASE_IMAGE,
         "kind": "base",
+        "hardware": "nvidia",
         "codeRef": "engines/base",
         "command": ["python", "serve.py"],
         "port": 8080,
@@ -224,6 +248,7 @@ def _save_base(name: str, image: str, note: str) -> dict:
         "name": name,
         "image": image,
         "kind": "base",
+        "hardware": machine_hardware(),
         "codeRef": "",
         "command": ["python", "serve.py"],
         "port": 8080,
@@ -291,7 +316,7 @@ def list_runtimes() -> list[dict]:
                     users.append(_read_user(folder))
                 except (OSError, json.JSONDecodeError):
                     continue
-    return [*_base_records(), *[grouped[image] for image in order], *users]
+    return [_stamp_hardware(item) for item in (*_base_records(), *[grouped[image] for image in order], *users)]
 
 
 def find_runtime(model_id: str, image: str) -> dict:
@@ -345,7 +370,8 @@ def create_user_runtime(
     check_serve(serve_source)
     pinned = check_requirements(requirements)
     parent = (base_image or BASE_IMAGE).strip()
-    if parent not in {item["image"] for item in _base_records()}:
+    parents = {item["image"]: item for item in _base_records()}
+    if parent not in parents:
         raise HTTPException(status_code=400, detail="请选择一张基础镜像")
     runtime_id = "rt_" + uuid.uuid4().hex[:8]
     image = f"local/user-{runtime_id}:latest"
@@ -356,6 +382,7 @@ def create_user_runtime(
         "name": name,
         "image": image,
         "kind": "user",
+        "hardware": _resolve_hardware(str(parents[parent].get("hardware") or "nvidia")),
         "codeRef": f"runtimes/{runtime_id}",
         "command": ["python", "serve.py"],
         "port": 8080,
@@ -407,6 +434,7 @@ def runtime_document(image: str) -> dict:
             "name": runtime["name"],
             "image": runtime["image"],
             "kind": runtime["kind"],
+            "hardware": runtime.get("hardware") or "nvidia",
             "command": list(runtime["command"]),
             "port": runtime["port"],
             "healthPath": runtime["healthPath"],

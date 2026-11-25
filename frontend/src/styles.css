@@ -448,6 +448,9 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .step strong { display: block; font-size: 14px; }
 .step span { display: block; color: var(--muted); font-size: 12px; }
 
+.badge-row { display: flex; gap: 8px; align-items: center; }
+.badge.nvidia { background: rgba(118, 185, 0, 0.18); color: #c6e68a; }
+.badge.ascend { background: rgba(196, 92, 74, 0.2); color: #f0b2a6; }
 .badge.builtin { background: rgba(61, 202, 164, 0.16); color: #8ef0d2; }
 .badge.user { background: rgba(226, 161, 90, 0.2); color: #f0c48a; }
 .badge.base { background: rgba(126, 182, 255, 0.16); color: #b7d4ff; }

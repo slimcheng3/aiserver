@@ -22,6 +22,7 @@ models:
       protocol: http
       models: [sam3]
       weightQuants: [fp16, bf16]
+      hardware: nvidia
     resources:
       gpu: 1
       gpuMemoryGi: 24
@@ -53,6 +54,7 @@ models:
       protocol: http
       models: [genpose2]
       weightQuants: [fp16, bf16]
+      hardware: nvidia
     resources:
       gpu: 1
       gpuMemoryGi: 16
@@ -90,6 +92,7 @@ models:
       protocol: websocket
       models: [pi05]
       weightQuants: [fp16, bf16]
+      hardware: auto
     resources:
       gpu: 1
       gpuMemoryGi: 24
@@ -121,6 +124,7 @@ models:
       protocol: http
       models: [qwen]
       weightQuants: [fp16, bf16, awq, gptq, fp8]
+      hardware: nvidia
     resources:
       gpu: 1
       gpuMemoryGi: 24

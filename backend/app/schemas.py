@@ -31,6 +31,14 @@ class EngineSpec(BaseModel):
     protocol: Protocol = "http"
     models: list[str] = Field(default_factory=list)
     weightQuants: list[QuantType] = Field(default_factory=list)
+    hardware: str = "nvidia"
+
+    @field_validator("hardware")
+    @classmethod
+    def known_hardware(cls, value: str) -> str:
+        if value not in {"nvidia", "ascend", "auto"}:
+            raise ValueError("hardware 只能是 nvidia、ascend 或 auto")
+        return value
 
 
 class ResourceSpec(BaseModel):

@@ -125,6 +125,7 @@ export interface RuntimeInfo {
   name: string;
   image: string;
   kind: "builtin" | "user" | "base";
+  hardware: "nvidia" | "ascend";
   codeRef: string;
   command: string[];
   port: number;

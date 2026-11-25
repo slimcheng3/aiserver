@@ -41,12 +41,15 @@ export function EnginesPage() {
     reload().catch((reason: Error) => setError(reason.message));
   }, []);
 
+  const visible = runtimes.filter((runtime) => matchesMachine(runtime, env?.device));
+  const bases = visible.filter((runtime) => runtime.kind === "base");
+
   return (
     <div className="page">
       <p className="page-kicker">同一台机体</p>
       <h1 className="page-title">运行时</h1>
       <p className="page-lead">
-        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。登记基础镜像时，本机没有的会从仓库拉取。镜像已经在本机时，普通构建会跳过；服务代码改过之后，用重新构建再打一次。本机已经有的运行时可以下载成压缩包，里面是 runtime.tar 和 runtime.json。另一台机器解压后用 docker load -i runtime.tar 导入。权重不在这个包里。
+        内置运行时由交付台提供镜像和服务代码。需要额外的 Python 包时，用基础镜像加上自己的 serve.py 和 requirements.txt 构建一份新运行时。登记基础镜像时，本机没有的会从仓库拉取。镜像已经在本机时，普通构建会跳过；服务代码改过之后，用重新构建再打一次。检测到英伟达就只列出英伟达运行时，检测到昇腾就只列出昇腾运行时。本机已经有的运行时可以下载成压缩包，里面是 runtime.tar 和 runtime.json。另一台机器解压后用 docker load -i runtime.tar 导入。权重不在这个包里。
       </p>
       {error && <p className="error">{error}</p>}
       {env && (
@@ -62,43 +65,44 @@ export function EnginesPage() {
         <h2 className="section-title">内置运行时</h2>
         <p className="page-lead">交付台维护镜像和服务代码。这里不能改其中的文件，也不能通过 requirements.txt 往里加包。</p>
         <div className="grid-models">
-          {runtimes
+          {visible
             .filter((runtime) => runtime.kind === "builtin")
             .map((runtime) => (
               <RuntimeCard key={runtime.image} runtime={runtime} models={models} env={env} building={building} />
             ))}
         </div>
+        {env && visible.every((runtime) => runtime.kind !== "builtin") && (
+          <p className="empty">这台机器上没有对应的内置运行时。</p>
+        )}
       </section>
 
       <section className="runtime-block">
         <h2 className="section-title">自定义运行时</h2>
         <p className="page-lead">目录里的加载方式不够用时，从下面的基础镜像上传 serve.py 和 requirements.txt。新镜像单独保存，内置运行时保持原样。</p>
         <div className="grid-models">
-          {runtimes
-            .filter((runtime) => runtime.kind === "base")
-            .map((runtime) => (
-              <RuntimeCard
-                key={runtime.image}
-                runtime={runtime}
-                models={models}
-                env={env}
-                building={building}
-                onChanged={() => reload().catch((reason: Error) => setError(reason.message))}
-              />
-            ))}
-          {runtimes
+          {bases.map((runtime) => (
+            <RuntimeCard
+              key={runtime.image}
+              runtime={runtime}
+              models={models}
+              env={env}
+              building={building}
+              onChanged={() => reload().catch((reason: Error) => setError(reason.message))}
+            />
+          ))}
+          {visible
             .filter((runtime) => runtime.kind === "user")
             .map((runtime) => (
               <RuntimeCard key={runtime.image} runtime={runtime} models={models} env={env} building={building} />
             ))}
         </div>
-        {runtimes.every((runtime) => runtime.kind !== "user") && <p className="empty">还没有自定义运行时。</p>}
+        {env && visible.every((runtime) => runtime.kind !== "user") && <p className="empty">还没有这一侧的自定义运行时。</p>}
         <NewBaseForm
           pulling={jobs.find((job) => job.action === "pull" && (job.status === "running" || job.status === "queued")) ?? null}
           onCreated={() => reload().catch((reason: Error) => setError(reason.message))}
         />
         <NewRuntimeForm
-          bases={runtimes.filter((runtime) => runtime.kind === "base")}
+          bases={bases}
           onCreated={() => reload().catch((reason: Error) => setError(reason.message))}
         />
       </section>
@@ -161,7 +165,10 @@ function RuntimeCard({
   return (
     <article className="model-card" data-kind={runtime.kind} data-tone={toneFor(runtime, models)}>
       <div className="card-top">
-        <span className={`badge ${runtime.kind}`}>{kindLabel}</span>
+        <span className="badge-row">
+          <span className={`badge ${runtime.kind}`}>{kindLabel}</span>
+          <span className={`badge ${runtime.hardware}`}>{runtime.hardware === "ascend" ? "昇腾" : "英伟达"}</span>
+        </span>
         <span className={`badge ${ready ? "ready" : active ? "starting" : "stopped"}`}>
           {ready ? "本机已有" : active ? "构建中" : "未构建"}
         </span>
@@ -216,6 +223,12 @@ function RuntimeCard({
       {cardError && <p className="error">{cardError}</p>}
     </article>
   );
+}
+
+function matchesMachine(runtime: RuntimeInfo, device: EnvironmentInfo["device"] | undefined): boolean {
+  if (device === "ascend") return runtime.hardware === "ascend";
+  if (device === "cuda") return runtime.hardware === "nvidia";
+  return true;
 }
 
 function toneFor(runtime: RuntimeInfo, models: ModelDef[]): string {

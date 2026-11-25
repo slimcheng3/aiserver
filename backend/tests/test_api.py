@@ -1055,6 +1055,22 @@ def test_runtime_tar_exports_a_local_image(tmp_path: Path, monkeypatch) -> None:
     assert document["image"] == "local/flashrt-engine:latest"
     assert document["protocol"] == "websocket"
     assert document["models"] == ["pi05"]
+    assert document["hardware"] == "nvidia"
+
+
+def test_runtime_hardware_follows_the_accelerator(tmp_path: Path, monkeypatch) -> None:
+    client = client_with(tmp_path, monkeypatch)
+    listed = {item["image"]: item["hardware"] for item in client.get("/api/runtimes").json()}
+    assert listed["local/sam3-engine:latest"] == "nvidia"
+    assert listed["local/vllm-engine:latest"] == "nvidia"
+    assert listed["local/base-cuda128-torch:latest"] == "nvidia"
+    assert listed["local/flashrt-engine:latest"] == "nvidia"
+
+    monkeypatch.setattr("app.runtimes.machine_hardware", lambda: "ascend")
+    listed = {item["image"]: item["hardware"] for item in client.get("/api/runtimes").json()}
+    assert listed["local/flashrt-engine:latest"] == "ascend"
+    assert listed["local/sam3-engine:latest"] == "nvidia"
+    assert listed["local/base-cuda128-torch:latest"] == "nvidia"
 
 
 def test_reference_serve_sample_is_accepted(tmp_path: Path, monkeypatch) -> None:

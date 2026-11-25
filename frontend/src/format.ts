@@ -38,6 +38,10 @@ export function formatTime(iso: string | null): string {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+export function weightPath(weight: { path?: string; localPath?: string | null; uri?: string }): string {
+  return weight.path || weight.localPath || weight.uri || "";
+}
+
 export function sourceLabel(source: string): string {
   if (source === "local") return "本地";
   if (source === "upload") return "上传";

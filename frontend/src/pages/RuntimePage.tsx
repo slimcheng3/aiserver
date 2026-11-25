@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { protocolLabel } from "../format";
-import type { Deployment, PackageView } from "../types";
+import type { Deployment, ModelDef, PackageView } from "../types";
 
 function parseHostPort(raw: string): number | undefined {
   const text = raw.trim();
@@ -15,14 +15,16 @@ function parseHostPort(raw: string): number | undefined {
 
 export function RuntimePage({ focus }: { focus: string | null }) {
   const [packages, setPackages] = useState<PackageView[]>([]);
+  const [models, setModels] = useState<ModelDef[]>([]);
   const [deploys, setDeploys] = useState<Deployment[]>([]);
   const [hostPorts, setHostPorts] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
 
   function reload() {
-    return Promise.all([api.packages(), api.deploys()]).then(([packageList, deployList]) => {
+    return Promise.all([api.packages(), api.deploys(), api.models()]).then(([packageList, deployList, modelList]) => {
       setPackages(packageList);
       setDeploys(deployList);
+      setModels(modelList);
     });
   }
 
@@ -113,7 +115,7 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                       <a href={`#/packages/${id}`}>
                         <strong>{item.manifest.metadata.name}</strong>
                       </a>
-                      <div className="hint">{item.manifest.model.displayName}</div>
+                      <div className="hint">{models.find((model) => model.id === item.manifest.model.id)?.displayName ?? item.manifest.model.id}</div>
                     </td>
                     <td className="mono">{item.manifest.engine.image}</td>
                     <td>{protocolLabel(item.manifest.engine.protocol)}</td>

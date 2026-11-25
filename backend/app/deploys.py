@@ -119,10 +119,21 @@ def _endpoint(protocol: str, port: int) -> str:
     return f"{scheme}://127.0.0.1:{port}"
 
 
+def _weight_path(weight: dict) -> str:
+    path = str(weight.get("path") or weight.get("localPath") or "")
+    if path:
+        return path
+    return str(weight.get("uri") or "")
+
+
+def _is_remote(weight: dict) -> bool:
+    return weight.get("source") == "s3" or _weight_path(weight).startswith("s3://")
+
+
 def _host_path(weight: dict) -> Path:
-    raw = weight.get("localPath") or ""
-    if not raw:
-        raise HTTPException(status_code=400, detail=f"{weight.get('label') or weight.get('role')} 没有本机路径")
+    raw = _weight_path(weight)
+    if not raw or raw.startswith("s3://"):
+        raise HTTPException(status_code=400, detail=f"{weight.get('role') or '权重'} 没有本机路径")
     path = Path(raw)
     if not path.exists():
         raise HTTPException(status_code=400, detail=f"本机路径不存在：{path}")
@@ -203,7 +214,7 @@ def deploy(package_id: str, host_port: int | None = None) -> dict:
         existing = _sync(existing)
     if existing and existing.get("status") == "running":
         return existing
-    if any(weight.get("source") == "s3" for weight in weights):
+    if any(_is_remote(weight) for weight in weights):
         raise HTTPException(status_code=400, detail="本机部署使用本机路径，不能用 S3 地址")
     code, output = docker_cli.run(["image", "inspect", engine["image"]])
     if code != 0:
@@ -226,7 +237,7 @@ def deploy(package_id: str, host_port: int | None = None) -> dict:
         "pipeline": pipeline,
         "command": [],
         "logs": [f"使用已有镜像 {engine['image']}，不再构建", port_note],
-        "gpu": engine.get("resources", {}).get("gpu", 0),
+        "gpu": engine.get("resources", {}).get("gpu", 1),
         "env": engine.get("env") or {},
         "createdAt": now_iso(),
     }

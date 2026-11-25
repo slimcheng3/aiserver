@@ -67,21 +67,15 @@ export interface WeightAsset {
 
 export interface WeightEntry {
   role: string;
-  label: string;
-  source: WeightSource;
-  kind: WeightKind;
-  name: string;
-  uri: string;
-  sizeBytes: number | null;
-  sha256: string | null;
-  relativePath: string | null;
-  localPath: string | null;
-  endpoint: string | null;
-  region: string | null;
-  bucket: string | null;
-  key: string | null;
-  note: string | null;
+  path?: string;
   quant?: string | null;
+  label?: string;
+  source?: WeightSource;
+  kind?: WeightKind;
+  name?: string;
+  uri?: string;
+  sizeBytes?: number | null;
+  localPath?: string | null;
 }
 
 export interface Manifest {
@@ -91,30 +85,27 @@ export interface Manifest {
     id: string;
     name: string;
     version: string;
-    description: string;
-    createdAt: string;
+    description?: string;
+    createdAt?: string;
   };
   model: {
     id: string;
-    displayName: string;
-    vendor: string;
-    task: string;
-    interfaces: { inputs: string[]; outputs: string[] };
+    displayName?: string;
+    interfaces?: { inputs: string[]; outputs: string[] };
   };
   engine: {
     image: string;
-    codeRef: string;
     command: string[];
     port: number;
-    healthPath: string;
     protocol: Protocol;
-    env: Record<string, string>;
-    resources: Resources;
+    codeRef?: string;
+    healthPath?: string;
+    env?: Record<string, string>;
+    resources?: Resources;
     models?: string[];
     weightQuants?: string[];
   };
   weights: WeightEntry[];
-  package: { id: string; root: string };
 }
 
 export interface PackageView {

@@ -88,7 +88,6 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
   const [modelId, setModelId] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [version, setVersion] = useState("1.0.0");
-  const [description, setDescription] = useState("");
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [quants, setQuants] = useState<Record<string, string>>({});
   const [engine, setEngine] = useState<EngineForm | null>(null);
@@ -248,7 +247,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
         modelId: model.id,
         name,
         version,
-        description,
+        description: "",
         weights,
         engine: {
           image: engine.image,
@@ -324,10 +323,6 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
               <div className="field">
                 <label htmlFor="pkg-version">版本</label>
                 <input id="pkg-version" className="input" value={version} onChange={(event) => setVersion(event.target.value)} />
-              </div>
-              <div className="field span-2">
-                <label htmlFor="pkg-desc">说明</label>
-                <textarea id="pkg-desc" className="textarea" value={description} onChange={(event) => setDescription(event.target.value)} />
               </div>
             </div>
           </section>
@@ -525,32 +520,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
             ) : (
               <p className="hint">{engine.command || "未记录启动命令"}</p>
             )}
-            <p className="hint">服务代码 {engine.codeRef || "未记录"}。只记录位置，不复制进模型包。</p>
-            <p className="hint">健康检查 {engine.healthPath}</p>
-            <p className="hint">
-              支持的模型：
-              {runtime.models
-                .map((id) => models.find((item) => item.id === id)?.displayName ?? id)
-                .join("、")}
-            </p>
             <p className="hint">支持的权重：{runtime.weightQuants.join("、")}</p>
-            <div className="res-grid" style={{ marginTop: 12 }}>
-              <NumberField label="GPU 数量" value={engine.gpu} onChange={(value) => setEngine({ ...engine, gpu: value })} />
-              <NumberField label="显存 GiB" value={engine.gpuMemoryGi} onChange={(value) => setEngine({ ...engine, gpuMemoryGi: value })} />
-              <NumberField label="CPU" value={engine.cpu} onChange={(value) => setEngine({ ...engine, cpu: value })} />
-              <NumberField label="内存 GiB" value={engine.memoryGi} onChange={(value) => setEngine({ ...engine, memoryGi: value })} />
-            </div>
-            <div className="field" style={{ marginTop: 12 }}>
-              <label htmlFor="env">环境变量</label>
-              <textarea
-                id="env"
-                className="textarea"
-                value={engine.envText}
-                onChange={(event) => setEngine({ ...engine, envText: event.target.value })}
-                placeholder={"# 一行一个\nHF_HUB_OFFLINE=1"}
-                spellCheck={false}
-              />
-            </div>
           </section>
         </div>
 
@@ -580,10 +550,6 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
                   </div>
                 );
               })}
-            </dd>
-            <dt>资源</dt>
-            <dd>
-              GPU {engine.gpu} · {engine.gpuMemoryGi} GiB
             </dd>
           </dl>
           <button type="button" className="btn primary block" disabled={saving} onClick={() => void onSubmit()}>
@@ -632,15 +598,6 @@ function RuntimeField({
           </option>
         ))}
       </select>
-    </div>
-  );
-}
-
-function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
-  return (
-    <div className="field">
-      <label>{label}</label>
-      <input className="input" type="number" min={0} value={value} onChange={(event) => onChange(Number(event.target.value))} />
     </div>
   );
 }

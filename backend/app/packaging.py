@@ -13,7 +13,6 @@ from app.schemas import PackageCreate, PackageView
 from app.storage import get_asset, now_iso
 
 API_VERSION = "aiserver.modelpackage/v1"
-PACKAGER_VERSION = "0.1.0"
 _PKG_ID = re.compile(r"pkg_[a-f0-9]{12}")
 
 
@@ -138,26 +137,10 @@ def create_package(body: PackageCreate) -> PackageView:
                 )
         elif binding.quant is not None:
             raise HTTPException(status_code=400, detail=f"{spec.label} 不标量化类型")
-        weight_entries.append(
-            {
-                "role": binding.role,
-                "label": spec.label,
-                "quant": binding.quant,
-                "source": asset.source,
-                "kind": asset.kind,
-                "name": asset.name,
-                "uri": asset.uri,
-                "sizeBytes": asset.sizeBytes,
-                "sha256": asset.sha256,
-                "relativePath": asset.relativePath,
-                "localPath": asset.localPath,
-                "endpoint": asset.endpoint,
-                "region": asset.region,
-                "bucket": asset.bucket,
-                "key": asset.key,
-                "note": asset.note,
-            }
-        )
+        entry = {"role": binding.role, "path": asset.localPath or asset.uri}
+        if binding.quant:
+            entry["quant"] = binding.quant
+        weight_entries.append(entry)
 
     pkg_id = "pkg_" + uuid.uuid4().hex[:12]
     folder = data_root() / "packages" / pkg_id
@@ -165,35 +148,20 @@ def create_package(body: PackageCreate) -> PackageView:
     manifest = {
         "apiVersion": API_VERSION,
         "kind": "ModelPackage",
-        "packager": {"name": "aiserver-console", "version": PACKAGER_VERSION},
         "metadata": {
             "id": pkg_id,
             "name": body.name,
             "version": body.version,
-            "description": body.description,
             "createdAt": now_iso(),
         },
-        "model": {
-            "id": model.id,
-            "displayName": model.displayName,
-            "vendor": model.vendor,
-            "task": model.task,
-            "interfaces": model.interfaces.model_dump(),
-        },
+        "model": {"id": model.id},
         "engine": {
             "image": runtime["image"],
-            "codeRef": runtime["codeRef"],
             "command": _command_for_package(runtime, body.engine.command),
             "port": runtime["port"],
-            "healthPath": runtime["healthPath"],
             "protocol": runtime["protocol"],
-            "env": body.engine.env,
-            "resources": body.engine.resources.model_dump(),
-            "models": list(runtime["models"]),
-            "weightQuants": list(runtime["weightQuants"]),
         },
         "weights": weight_entries,
-        "package": {"id": pkg_id, "root": f"packages/{pkg_id}"},
     }
     (folder / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",

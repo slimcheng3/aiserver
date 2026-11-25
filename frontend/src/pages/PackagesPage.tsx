@@ -1,14 +1,20 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { flow, formatTime, sourceLabel } from "../format";
-import type { PackageView } from "../types";
+import { flow, formatTime } from "../format";
+import type { ModelDef, PackageView } from "../types";
 
 export function PackagesPage() {
   const [packages, setPackages] = useState<PackageView[]>([]);
+  const [models, setModels] = useState<ModelDef[]>([]);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api.packages().then(setPackages).catch((reason: Error) => setError(reason.message));
+    Promise.all([api.packages(), api.models()])
+      .then(([packageList, modelList]) => {
+        setPackages(packageList);
+        setModels(modelList);
+      })
+      .catch((reason: Error) => setError(reason.message));
   }, []);
 
   return (
@@ -38,7 +44,7 @@ export function PackagesPage() {
             <tbody>
               {packages.map((item) => {
                 const manifest = item.manifest;
-                const sources = [...new Set(manifest.weights.map((weight) => sourceLabel(weight.source)))].join("、");
+                const named = models.find((model) => model.id === manifest.model.id);
                 const quants = [...new Set(manifest.weights.map((weight) => weight.quant).filter((quant): quant is string => Boolean(quant)))].join("、");
                 return (
                   <tr key={manifest.metadata.id}>
@@ -49,14 +55,14 @@ export function PackagesPage() {
                       <div className="hint">{manifest.metadata.version}</div>
                     </td>
                     <td>
-                      {manifest.model.displayName}
-                      <div className="hint">{flow(manifest.model.interfaces.inputs, manifest.model.interfaces.outputs)}</div>
+                      {named?.displayName ?? manifest.model.displayName ?? manifest.model.id}
+                      {named ? <div className="hint">{flow(named.interfaces.inputs, named.interfaces.outputs)}</div> : null}
                     </td>
                     <td>
-                      {manifest.weights.length} 个 · {sources || "—"}
+                      {manifest.weights.length} 个
                       {quants ? ` · ${quants}` : ""}
                     </td>
-                    <td>{formatTime(manifest.metadata.createdAt)}</td>
+                    <td>{formatTime(manifest.metadata.createdAt ?? null)}</td>
                   </tr>
                 );
               })}

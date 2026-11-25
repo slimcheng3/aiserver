@@ -78,8 +78,9 @@ def test_local_weight_becomes_package(tmp_path: Path, monkeypatch) -> None:
     manifest = created.json()["manifest"]
     assert manifest["apiVersion"] == "aiserver.modelpackage/v1"
     assert manifest["model"]["id"] == "sam3"
-    assert manifest["weights"][0]["uri"].startswith("file:")
-    assert manifest["weights"][0]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert manifest["weights"][0]["path"].endswith("demo.pt")
+    assert set(manifest) == {"apiVersion", "kind", "metadata", "model", "engine", "weights"}
+    assert manifest["model"] == {"id": "sam3"}
     assert manifest["engine"]["image"] == "local/sam3-engine:latest"
     pkg_id = manifest["metadata"]["id"]
     assert (tmp_path / "packages" / pkg_id / "manifest.json").exists()
@@ -118,12 +119,9 @@ def test_s3_weight_is_referenced_not_downloaded(tmp_path: Path, monkeypatch) -> 
     )
     assert created.status_code == 200
     weight = created.json()["manifest"]["weights"][0]
-    assert weight["uri"] == "s3://models/sam3/sam3.pt"
+    assert weight["path"] == "s3://models/sam3/sam3.pt"
     assert weight["quant"] == "bf16"
-    assert weight["endpoint"] == "http://127.0.0.1:9000"
-    assert weight["localPath"] is None
-    assert created.json()["manifest"]["engine"]["models"] == ["sam3"]
-    assert "bf16" in created.json()["manifest"]["engine"]["weightQuants"]
+    assert "endpoint" not in weight
 
 
 def test_upload_and_reject_missing_required_weight(tmp_path: Path, monkeypatch) -> None:
@@ -210,8 +208,7 @@ def test_quant_must_match_runtime(tmp_path: Path, monkeypatch) -> None:
     assert created.status_code == 200
     manifest = created.json()["manifest"]
     assert manifest["weights"][0]["quant"] == "awq"
-    assert manifest["engine"]["models"] == ["qwen"]
-    assert "awq" in manifest["engine"]["weightQuants"]
+    assert manifest["engine"]["image"] == "local/vllm-engine:latest"
     assert manifest["engine"]["port"] == 8000
     assert manifest["engine"]["command"][:2] == ["--model", "/weights/checkpoint"]
 
@@ -393,7 +390,7 @@ def test_user_runtime_then_package(tmp_path: Path, monkeypatch) -> None:
     assert engine["image"] == image
     assert engine["port"] == 8080
     assert engine["command"] == ["python", "serve.py"]
-    assert engine["weightQuants"] == ["fp16"]
+    assert "weightQuants" not in engine
 
 
 def test_build_skips_when_image_exists(tmp_path: Path, monkeypatch) -> None:

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { flow, formatBytes, formatTime, protocolLabel, sourceLabel } from "../format";
-import type { PackageView } from "../types";
+import { flow, formatTime, protocolLabel, weightPath } from "../format";
+import type { ModelDef, PackageView } from "../types";
 
 function parseHostPort(raw: string): number | undefined {
   const text = raw.trim();
@@ -15,6 +15,7 @@ function parseHostPort(raw: string): number | undefined {
 
 export function PackageDetailPage({ id }: { id: string }) {
   const [item, setItem] = useState<PackageView | null>(null);
+  const [models, setModels] = useState<ModelDef[]>([]);
   const [hostPort, setHostPort] = useState("");
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
@@ -22,6 +23,7 @@ export function PackageDetailPage({ id }: { id: string }) {
   useEffect(() => {
     setItem(null);
     api.package(id).then(setItem).catch((reason: Error) => setError(reason.message));
+    api.models().then(setModels).catch(() => undefined);
   }, [id]);
 
   async function copy(text: string, label: string) {
@@ -59,6 +61,9 @@ export function PackageDetailPage({ id }: { id: string }) {
   }
 
   const manifest = item.manifest;
+  const named = models.find((model) => model.id === manifest.model.id);
+  const modelName = named?.displayName ?? manifest.model.displayName ?? manifest.model.id;
+  const interfaces = named?.interfaces ?? manifest.model.interfaces;
   const separator = item.absoluteRoot.includes("\\") ? "\\" : "/";
   const manifestPath = `${item.absoluteRoot}${separator}manifest.json`;
 
@@ -67,15 +72,15 @@ export function PackageDetailPage({ id }: { id: string }) {
       <p className="page-kicker">{manifest.metadata.id}</p>
       <h1 className="page-title">{manifest.metadata.name}</h1>
       <p className="page-lead">
-        {manifest.metadata.description || "这份模型包只描述怎么部署，不包含参数大文件。"} 版本 {manifest.metadata.version} ·{" "}
-        {formatTime(manifest.metadata.createdAt)}
+        版本 {manifest.metadata.version}
+        {manifest.metadata.createdAt ? ` · ${formatTime(manifest.metadata.createdAt)}` : ""}
       </p>
       {error && <p className="error">{error}</p>}
       <div className="facts">
         <div className="fact">
           <span>模型</span>
-          <strong>{manifest.model.displayName}</strong>
-          <span>{flow(manifest.model.interfaces.inputs, manifest.model.interfaces.outputs)}</span>
+          <strong>{modelName}</strong>
+          {interfaces ? <span>{flow(interfaces.inputs, interfaces.outputs)}</span> : null}
         </div>
         <div className="fact">
           <span>运行时</span>
@@ -84,22 +89,13 @@ export function PackageDetailPage({ id }: { id: string }) {
             {protocolLabel(manifest.engine.protocol)} · {manifest.engine.port}
           </span>
         </div>
-        <div className="fact">
-          <span>资源</span>
-          <strong>
-            GPU {manifest.engine.resources.gpu} · {manifest.engine.resources.gpuMemoryGi} GiB
-          </strong>
-          <span>
-            CPU {manifest.engine.resources.cpu} · 内存 {manifest.engine.resources.memoryGi} GiB
-          </span>
-        </div>
       </div>
       <section className="section">
         <h2 className="section-title">部署到本机</h2>
         <p className="hint">在这台机体上启动容器，挂载清单里的本机路径。使用已经构建好的镜像，部署时不再构建。宿主机端口可指定，留空则自动分配。</p>
         <ul className="check-list">
           <li>运行时镜像 {manifest.engine.image} 需要已经构建，部署时不再构建</li>
-          <li>参数 {manifest.weights.map((weight) => weight.name).join("、") || "未绑定"} 留在原处</li>
+          <li>参数 {manifest.weights.map((weight) => weightPath(weight).split(/[/\\]/).pop() || weight.role).join("、") || "未绑定"} 留在原处</li>
           <li>容器内端口 {manifest.engine.port} 映射到宿主机端口；填写端口则使用该端口，留空则自动分配</li>
         </ul>
         <div className="toolbar">
@@ -135,21 +131,7 @@ export function PackageDetailPage({ id }: { id: string }) {
             删除包
           </button>
         </div>
-        {manifest.engine.codeRef && (
-          <p className="hint">推理代码：{manifest.engine.codeRef}。装配台只记录这个位置，不复制代码。</p>
-        )}
         <p className="hint">启动命令：{manifest.engine.command.join(" ")}</p>
-        {manifest.engine.models && manifest.engine.models.length > 0 && (
-          <p className="hint">
-            这份运行时支持的模型：
-            {manifest.engine.models
-              .map((id) => (id === manifest.model.id ? manifest.model.displayName : id))
-              .join("、")}
-          </p>
-        )}
-        {manifest.engine.weightQuants && manifest.engine.weightQuants.length > 0 && (
-          <p className="hint">这份运行时支持的权重：{manifest.engine.weightQuants.join("、")}</p>
-        )}
       </section>
       <section className="section">
         <h2 className="section-title">参数</h2>
@@ -158,35 +140,23 @@ export function PackageDetailPage({ id }: { id: string }) {
             <tr>
               <th>角色</th>
               <th>量化</th>
-              <th>来源</th>
-              <th>地址</th>
-              <th>大小</th>
+              <th>路径</th>
             </tr>
           </thead>
           <tbody>
             {manifest.weights.map((weight) => (
               <tr key={weight.role}>
-                <td>{weight.label}</td>
+                <td>{weight.role}</td>
                 <td>{weight.quant ?? "—"}</td>
-                <td>
-                  <span className={`badge ${weight.source}`}>{sourceLabel(weight.source)}</span>
-                </td>
-                <td className="mono">{weight.uri}</td>
-                <td>{formatBytes(weight.sizeBytes)}</td>
+                <td className="mono">{weightPath(weight)}</td>
               </tr>
             ))}
           </tbody>
         </table>
-        {manifest.weights.some((weight) => weight.source === "s3") && (
+        {manifest.weights.some((weight) => weightPath(weight).startsWith("s3://")) && (
           <p className="warn">S3 地址不能挂进本机容器。部署请改用本机路径或上传的权重。</p>
         )}
       </section>
-      {Object.keys(manifest.engine.env).length > 0 && (
-        <section className="section">
-          <h2 className="section-title">环境变量</h2>
-          <pre className="manifest">{Object.entries(manifest.engine.env).map(([key, value]) => `${key}=${value}`).join("\n")}</pre>
-        </section>
-      )}
       <section className="section">
         <h2 className="section-title">manifest.json</h2>
         <pre className="manifest">{JSON.stringify(manifest, null, 2)}</pre>

@@ -45,13 +45,11 @@ function engineFromRuntime(model: ModelDef, runtime: RuntimeChoice): EngineForm 
     port: runtime.port,
     healthPath: runtime.healthPath,
     protocol: runtime.protocol,
-    gpu: model.resources.gpu,
-    gpuMemoryGi: model.resources.gpuMemoryGi,
+    accelerators: model.resources.accelerators ?? model.resources.gpu ?? 1,
+    acceleratorMemoryGi: model.resources.acceleratorMemoryGi ?? model.resources.gpuMemoryGi ?? 16,
     cpu: model.resources.cpu,
     memoryGi: model.resources.memoryGi,
-    envText: Object.entries(model.env)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n"),
+    envRows: envRowsFrom(model.env),
   };
 }
 
@@ -68,14 +66,19 @@ function parseCommand(input: string): string[] {
   return trimmed.split(/\s+/);
 }
 
-function parseEnv(text: string): Record<string, string> {
+function envRowsFrom(env: Record<string, string>): { key: string; value: string }[] {
+  const rows = Object.entries(env).map(([key, value]) => ({ key, value }));
+  return rows.length ? rows : [{ key: "", value: "" }];
+}
+
+function envFromRows(rows: { key: string; value: string }[]): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const index = trimmed.indexOf("=");
-    if (index <= 0) throw new Error(`环境变量需要写成 KEY=VALUE：${trimmed}`);
-    env[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1);
+  for (const row of rows) {
+    const key = row.key.trim();
+    if (!key && !row.value.trim()) continue;
+    if (!key) throw new Error("环境变量需要填写名称");
+    if (key.includes("=") || /\s/.test(key)) throw new Error(`环境变量名不合法：${key}`);
+    env[key] = row.value;
   }
   return env;
 }
@@ -257,12 +260,12 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
           healthPath: engine.healthPath,
           protocol: engine.protocol,
           resources: {
-            gpu: Number(engine.gpu),
-            gpuMemoryGi: Number(engine.gpuMemoryGi),
+            accelerators: Number(engine.accelerators),
+            acceleratorMemoryGi: Number(engine.acceleratorMemoryGi),
             cpu: Number(engine.cpu),
             memoryGi: Number(engine.memoryGi),
           },
-          env: parseEnv(engine.envText),
+          env: envFromRows(engine.envRows),
         },
       });
       location.hash = `#/packages/${created.manifest.metadata.id}`;
@@ -493,7 +496,7 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
             />
             <p className="card-image">{engine.image}</p>
             <p className="hint">
-              {protocolLabel(engine.protocol)} · 容器内端口 {engine.port}
+              {protocolLabel(engine.protocol)} · 容器内端口 {engine.port} · 容器内权重 {runtime.weightsPath || "/weights/checkpoint"}
             </p>
             {engine.command.trim().startsWith("--") ? (
               <>
@@ -521,6 +524,65 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
               <p className="hint">{engine.command || "未记录启动命令"}</p>
             )}
             <p className="hint">支持的权重：{runtime.weightQuants.join("、")}</p>
+            <div className="res-grid" style={{ marginTop: 12 }}>
+              <NumberField label="加速卡" value={engine.accelerators} onChange={(value) => setEngine({ ...engine, accelerators: value })} />
+              <NumberField label="卡上内存 GiB" value={engine.acceleratorMemoryGi} onChange={(value) => setEngine({ ...engine, acceleratorMemoryGi: value })} />
+              <NumberField label="CPU" value={engine.cpu} onChange={(value) => setEngine({ ...engine, cpu: value })} />
+              <NumberField label="内存 GiB" value={engine.memoryGi} onChange={(value) => setEngine({ ...engine, memoryGi: value })} />
+            </div>
+            <p className="hint">会写入模型包。加速卡数量表示要几张卡（英伟达、昇腾等）。当前本机部署在数量大于 0 时仍加 --gpus all。卡上内存是声明，不会自动变成 --gpu-memory-utilization。</p>
+            <div className="field" style={{ marginTop: 12 }}>
+              <span>环境变量</span>
+              <div className="env-rows">
+                {engine.envRows.map((row, index) => (
+                  <div className="env-row" key={index}>
+                    <input
+                      className="input"
+                      value={row.key}
+                      onChange={(event) => {
+                        const envRows = engine.envRows.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, key: event.target.value } : item,
+                        );
+                        setEngine({ ...engine, envRows });
+                      }}
+                      placeholder="名称"
+                      spellCheck={false}
+                      aria-label={`环境变量名称 ${index + 1}`}
+                    />
+                    <input
+                      className="input"
+                      value={row.value}
+                      onChange={(event) => {
+                        const envRows = engine.envRows.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, value: event.target.value } : item,
+                        );
+                        setEngine({ ...engine, envRows });
+                      }}
+                      placeholder="值"
+                      spellCheck={false}
+                      aria-label={`环境变量值 ${index + 1}`}
+                    />
+                    <button
+                      type="button"
+                      className="btn small"
+                      onClick={() => {
+                        const envRows = engine.envRows.filter((_, itemIndex) => itemIndex !== index);
+                        setEngine({ ...engine, envRows: envRows.length ? envRows : [{ key: "", value: "" }] });
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="btn small"
+                onClick={() => setEngine({ ...engine, envRows: [...engine.envRows, { key: "", value: "" }] })}
+              >
+                添加
+              </button>
+            </div>
           </section>
         </div>
 
@@ -550,6 +612,10 @@ export function NewPackagePage({ initialModel }: { initialModel: string | null }
                   </div>
                 );
               })}
+            </dd>
+            <dt>资源</dt>
+            <dd>
+              加速卡 {engine.accelerators} · {engine.acceleratorMemoryGi} GiB · CPU {engine.cpu} · {engine.memoryGi} GiB
             </dd>
           </dl>
           <button type="button" className="btn primary block" disabled={saving} onClick={() => void onSubmit()}>
@@ -599,6 +665,29 @@ function RuntimeField({
         ))}
       </select>
     </div>
+  );
+}
+
+function NumberField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <input
+        className="input"
+        type="number"
+        min={0}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
   );
 }
 

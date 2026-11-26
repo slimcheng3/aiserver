@@ -146,17 +146,26 @@ def pipeline_beside(path: Path) -> Path | None:
     return found if found.is_file() else None
 
 
-def _mounts(weights: list[dict]) -> tuple[list[tuple[str, str]], str, str | None]:
+def _accelerator_count(engine: dict) -> int:
+    resources = engine.get("resources") or {}
+    if "accelerators" in resources:
+        return int(resources.get("accelerators") or 0)
+    return int(resources.get("gpu") or 1)
+
+
+def _container_weights(engine: dict) -> str:
+    path = str(engine.get("weightsPath") or "/weights/checkpoint").strip()
+    if not path.startswith("/") or path == "/" or ".." in path.split("/"):
+        raise HTTPException(status_code=400, detail="engine.weightsPath 不合法")
+    return path
+
+
+def _mounts(weights: list[dict], weights_path: str) -> tuple[list[tuple[str, str]], str, str | None]:
     primary = next((item for item in weights if item.get("role") != "cad"), weights[0])
     host = _host_path(primary)
     pipeline = pipeline_beside(host)
-    mounts: list[tuple[str, str]] = []
-    if host.is_dir():
-        container_weights = "/weights/checkpoint"
-        mounts.append((_docker_path(host), container_weights))
-    else:
-        container_weights = "/weights/" + host.name
-        mounts.append((_docker_path(host.parent), "/weights"))
+    mounts: list[tuple[str, str]] = [(_docker_path(host), weights_path)]
+    container_weights = weights_path
     used = {primary.get("role")}
     for weight in weights:
         if weight.get("role") in used:
@@ -192,7 +201,7 @@ def _run_args(
     ]
     for key, value in record.get("env") or {}.items():
         args.extend(["-e", f"{key}={value}"])
-    if int(record.get("gpu") or 0) > 0:
+    if int(record.get("accelerators") or record.get("gpu") or 0) > 0:
         args.extend(["--gpus", "all"])
     if "vllm" in str(record.get("image") or ""):
         args.extend(["--ipc", "host"])
@@ -220,7 +229,7 @@ def deploy(package_id: str, host_port: int | None = None) -> dict:
     if code != 0:
         detail = output or "镜像还没构建"
         raise HTTPException(status_code=400, detail=f"镜像还没构建：{engine['image']}。{detail}")
-    mounts, container_weights, pipeline = _mounts(weights)
+    mounts, container_weights, pipeline = _mounts(weights, _container_weights(engine))
     host_port, port_note = _pick_host_port(host_port)
     record = {
         "packageId": package_id,
@@ -237,7 +246,7 @@ def deploy(package_id: str, host_port: int | None = None) -> dict:
         "pipeline": pipeline,
         "command": [],
         "logs": [f"使用已有镜像 {engine['image']}，不再构建", port_note],
-        "gpu": engine.get("resources", {}).get("gpu", 1),
+        "accelerators": _accelerator_count(engine),
         "env": engine.get("env") or {},
         "createdAt": now_iso(),
     }

@@ -42,7 +42,7 @@ scripts/console.sh stop
   "kind": "ModelPackage",
   "metadata": {"id": "pkg_...", "name": "车间分割", "version": "1.0.0"},
   "model": {"id": "sam3"},
-  "engine": {"image": "local/sam3-engine:latest", "command": ["python", "serve.py"], "port": 8080},
+  "engine": {"image": "local/sam3-engine:latest", "command": ["python", "serve.py"], "port": 8080, "weightsPath": "/weights/checkpoint"},
   "weights": [{"role": "checkpoint", "source": "s3", "uri": "s3://models/sam3/sam3.pt"}]
 }
 ```

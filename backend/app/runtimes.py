@@ -119,6 +119,7 @@ def _resolve_hardware(value: str) -> str:
 def _stamp_hardware(record: dict) -> dict:
     stamped = dict(record)
     stamped["hardware"] = _resolve_hardware(str(record.get("hardware") or "nvidia"))
+    stamped["weightsPath"] = str(record.get("weightsPath") or "/weights/checkpoint").strip() or "/weights/checkpoint"
     return stamped
 
 
@@ -133,6 +134,7 @@ def _builtin(model) -> dict:
         "codeRef": engine.codeRef,
         "command": list(engine.command),
         "port": engine.port,
+        "weightsPath": engine.weightsPath,
         "healthPath": engine.healthPath,
         "protocol": engine.protocol,
         "models": list(engine.models),
@@ -153,6 +155,7 @@ def _builtin_base() -> dict:
         "codeRef": "engines/base",
         "command": ["python", "serve.py"],
         "port": 8080,
+        "weightsPath": "/weights/checkpoint",
         "healthPath": "/health",
         "protocol": "http",
         "models": [],
@@ -252,6 +255,7 @@ def _save_base(name: str, image: str, note: str) -> dict:
         "codeRef": "",
         "command": ["python", "serve.py"],
         "port": 8080,
+        "weightsPath": "/weights/checkpoint",
         "healthPath": "/health",
         "protocol": "http",
         "models": [],
@@ -386,6 +390,7 @@ def create_user_runtime(
         "codeRef": f"runtimes/{runtime_id}",
         "command": ["python", "serve.py"],
         "port": 8080,
+        "weightsPath": "/weights/checkpoint",
         "healthPath": "/health",
         "protocol": "http",
         "models": model_ids,
@@ -437,6 +442,7 @@ def runtime_document(image: str) -> dict:
             "hardware": runtime.get("hardware") or "nvidia",
             "command": list(runtime["command"]),
             "port": runtime["port"],
+            "weightsPath": runtime.get("weightsPath") or "/weights/checkpoint",
             "healthPath": runtime["healthPath"],
             "protocol": runtime["protocol"],
             "models": list(runtime["models"]),

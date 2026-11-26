@@ -23,7 +23,9 @@
     "image": "local/flashrt-engine:latest",
     "command": ["python", "serve.py"],
     "port": 8000,
-    "protocol": "websocket"
+    "weightsPath": "/weights/checkpoint",
+    "protocol": "websocket",
+    "resources": {"accelerators": 1, "acceleratorMemoryGi": 24, "cpu": 8, "memoryGi": 64}
   },
   "weights": [
     { "role": "checkpoint", "quant": "fp16", "path": "/home/kim/slim_models/pi05_libero" }
@@ -40,7 +42,9 @@ Qwen 的镜像是 vLLM，启动命令是它自己的参数，权重角色是 `mo
     "image": "local/vllm-engine:latest",
     "command": ["--model", "/weights/checkpoint", "--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "0.5"],
     "port": 8000,
-    "protocol": "http"
+    "weightsPath": "/weights/checkpoint",
+    "protocol": "http",
+    "resources": {"accelerators": 1, "acceleratorMemoryGi": 24, "cpu": 8, "memoryGi": 48}
   },
   "weights": [
     { "role": "model_dir", "quant": "fp16", "path": "/home/kim/slim_models/qwen/Qwen2.5-1.5B-Instruct" }
@@ -62,7 +66,10 @@ Qwen 的镜像是 vLLM，启动命令是它自己的参数，权重角色是 `mo
 | `engine.image` | 运行时镜像名。部署时这张镜像必须已经在本机 |
 | `engine.command` | 容器启动命令。多数运行时是 `python serve.py`；vLLM 是一串以 `--` 开头的参数 |
 | `engine.port` | 容器内端口。宿主机端口在部署时另定，留空则自动分配 |
+| `engine.weightsPath` | 容器内主权重路径。部署时把 `weights[].path` 只读挂到这里。当前模型都是 `/weights/checkpoint`。vLLM 的 `--model` 与此相同 |
 | `engine.protocol` | `http` 或 `websocket`。π0.5 是 `websocket`，其余当前模型是 `http` |
+| `engine.resources` | 装配时填写。`accelerators` 是加速卡数量（英伟达、昇腾等），`acceleratorMemoryGi` 是卡上内存。部署时数量大于 0 目前仍加 `--gpus all`。卡上内存不会自动变成 `--gpu-memory-utilization`。旧清单里的 `gpu` / `gpuMemoryGi` 仍能读 |
+| `engine.env` | 装配时填写的环境变量，部署时以 `-e` 传入容器 |
 | `weights[].role` | 权重角色。SAM 3、GenPose2、π0.5 是 `checkpoint`；Qwen 是 `model_dir`。可选的附加文件用别的角色，例如 `cad` |
 | `weights[].quant` | 量化或精度：`fp16`、`bf16`、`int8`、`awq`、`gptq`、`fp8`。必须是该运行时声明能读的一种。不加量化标记的角色没有这个字段 |
 | `weights[].path` | 权重位置。本机文件或目录用绝对路径；对象存储用 `s3://bucket/key` |
@@ -71,8 +78,8 @@ Qwen 的镜像是 vLLM，启动命令是它自己的参数，权重角色是 `mo
 
 ## 部署时怎么用
 
-本机部署把 `path` 只读挂进容器。目录挂到 `/weights/checkpoint`；单个文件挂到 `/weights/<文件名>`，所在目录挂到 `/weights`。主权重以外的角色挂到 `/weights/roles/<角色名>`。
+本机部署把 `path` 只读挂到 `engine.weightsPath`。主权重以外的角色挂到 `/weights/roles/<角色名>`。旧清单没有 `weightsPath` 时，按 `/weights/checkpoint`。
 
 `path` 以 `s3://` 开头时，不能部署到本机，因为容器挂的是本机路径。
 
-清单不记 GPU 数量。部署时默认使用一块 GPU。健康检查路径未写入清单时，按 `/health`。
+健康检查路径未写入清单时，按 `/health`。`engine.resources` 缺失时，部署按 1 张加速卡。

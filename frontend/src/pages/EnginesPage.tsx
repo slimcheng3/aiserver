@@ -176,7 +176,7 @@ function RuntimeCard({
       <h2 className="card-name">{runtime.kind === "user" ? runtime.name : runtime.image}</h2>
       {runtime.kind === "user" && <p className="mono">{runtime.image}</p>}
       <p className="hint">
-        {protocolLabel(runtime.protocol)} · 容器内端口 {runtime.port} · {runtime.command.join(" ")}
+        {protocolLabel(runtime.protocol)} · 容器内端口 {runtime.port} · 容器内权重 {runtime.weightsPath || "/weights/checkpoint"} · {runtime.command.join(" ")}
       </p>
       <p className="hint">{hint}</p>
       {runtime.codeRef && <p className="hint">服务代码 {runtime.codeRef}</p>}

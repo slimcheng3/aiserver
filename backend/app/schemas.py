@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 Protocol = Literal["http", "websocket", "grpc"]
@@ -27,11 +27,22 @@ class EngineSpec(BaseModel):
     codeRef: str = ""
     command: list[str]
     port: int
+    weightsPath: str = "/weights/checkpoint"
     healthPath: str = "/health"
     protocol: Protocol = "http"
     models: list[str] = Field(default_factory=list)
     weightQuants: list[QuantType] = Field(default_factory=list)
     hardware: str = "nvidia"
+
+    @field_validator("weightsPath")
+    @classmethod
+    def weights_path_ok(cls, value: str) -> str:
+        value = value.strip()
+        if not value.startswith("/") or value == "/" or ".." in value.split("/"):
+            raise ValueError("容器内权重路径需要是绝对路径，例如 /weights/checkpoint")
+        if len(value) > 200:
+            raise ValueError("容器内权重路径过长")
+        return value
 
     @field_validator("hardware")
     @classmethod
@@ -42,12 +53,24 @@ class EngineSpec(BaseModel):
 
 
 class ResourceSpec(BaseModel):
-    gpu: int = 1
-    gpuMemoryGi: int = 16
+    accelerators: int = 1
+    acceleratorMemoryGi: int = 16
     cpu: int = 4
     memoryGi: int = 32
 
-    @field_validator("gpu", "gpuMemoryGi", "cpu", "memoryGi")
+    @model_validator(mode="before")
+    @classmethod
+    def accept_gpu_names(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "accelerators" not in data and "gpu" in data:
+            data["accelerators"] = data["gpu"]
+        if "acceleratorMemoryGi" not in data and "gpuMemoryGi" in data:
+            data["acceleratorMemoryGi"] = data["gpuMemoryGi"]
+        return data
+
+    @field_validator("accelerators", "acceleratorMemoryGi", "cpu", "memoryGi")
     @classmethod
     def non_negative(cls, value: int) -> int:
         if value < 0 or value > 4096:

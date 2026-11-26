@@ -18,14 +18,15 @@ models:
       codeRef: engines/sam3
       command: ["python", "serve.py"]
       port: 8080
+      weightsPath: /weights/checkpoint
       healthPath: /health
       protocol: http
       models: [sam3]
       weightQuants: [fp16, bf16]
       hardware: nvidia
     resources:
-      gpu: 1
-      gpuMemoryGi: 24
+      accelerators: 1
+      acceleratorMemoryGi: 24
       cpu: 4
       memoryGi: 32
     env: {}
@@ -50,14 +51,15 @@ models:
       codeRef: engines/genpose2
       command: ["python", "serve.py"]
       port: 8081
+      weightsPath: /weights/checkpoint
       healthPath: /health
       protocol: http
       models: [genpose2]
       weightQuants: [fp16, bf16]
       hardware: nvidia
     resources:
-      gpu: 1
-      gpuMemoryGi: 16
+      accelerators: 1
+      acceleratorMemoryGi: 16
       cpu: 4
       memoryGi: 24
     env: {}
@@ -88,14 +90,15 @@ models:
       codeRef: engines/flashrt
       command: ["python", "serve.py"]
       port: 8000
+      weightsPath: /weights/checkpoint
       healthPath: /health
       protocol: websocket
       models: [pi05]
       weightQuants: [fp16, bf16]
       hardware: auto
     resources:
-      gpu: 1
-      gpuMemoryGi: 24
+      accelerators: 1
+      acceleratorMemoryGi: 24
       cpu: 8
       memoryGi: 64
     env: {}
@@ -120,14 +123,15 @@ models:
       codeRef: engines/vllm
       command: ["--model", "/weights/checkpoint", "--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "0.5"]
       port: 8000
+      weightsPath: /weights/checkpoint
       healthPath: /health
       protocol: http
       models: [qwen]
       weightQuants: [fp16, bf16, awq, gptq, fp8]
       hardware: nvidia
     resources:
-      gpu: 1
-      gpuMemoryGi: 24
+      accelerators: 1
+      acceleratorMemoryGi: 24
       cpu: 8
       memoryGi: 48
     env: {}

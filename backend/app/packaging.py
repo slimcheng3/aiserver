@@ -86,6 +86,25 @@ def _command_for_package(runtime: dict, submitted: list[str]) -> list[str]:
     return locked + extra
 
 
+def _weights_path_for_package(runtime: dict) -> str:
+    path = str(runtime.get("weightsPath") or "/weights/checkpoint").strip()
+    if not path.startswith("/") or path == "/" or ".." in path.split("/"):
+        raise HTTPException(status_code=400, detail="容器内权重路径不合法")
+    return path
+
+
+def _apply_model_flag(command: list[str], weights_path: str) -> list[str]:
+    if "--model" not in command:
+        return command
+    out = list(command)
+    index = out.index("--model")
+    if index + 1 < len(out) and not out[index + 1].startswith("-"):
+        out[index + 1] = weights_path
+    else:
+        out.insert(index + 1, weights_path)
+    return out
+
+
 def delete_package(pkg_id: str) -> None:
     _check_id(pkg_id)
     folder = data_root() / "packages" / pkg_id
@@ -145,6 +164,7 @@ def create_package(body: PackageCreate) -> PackageView:
     pkg_id = "pkg_" + uuid.uuid4().hex[:12]
     folder = data_root() / "packages" / pkg_id
     folder.mkdir(parents=True, exist_ok=False)
+    weights_path = _weights_path_for_package(runtime)
     manifest = {
         "apiVersion": API_VERSION,
         "kind": "ModelPackage",
@@ -157,9 +177,12 @@ def create_package(body: PackageCreate) -> PackageView:
         "model": {"id": model.id},
         "engine": {
             "image": runtime["image"],
-            "command": _command_for_package(runtime, body.engine.command),
+            "command": _apply_model_flag(_command_for_package(runtime, body.engine.command), weights_path),
             "port": runtime["port"],
+            "weightsPath": weights_path,
             "protocol": runtime["protocol"],
+            "resources": body.engine.resources.model_dump(),
+            "env": body.engine.env,
         },
         "weights": weight_entries,
     }

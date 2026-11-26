@@ -14,8 +14,10 @@ export interface ArtifactSpec {
 }
 
 export interface Resources {
-  gpu: number;
-  gpuMemoryGi: number;
+  accelerators?: number;
+  acceleratorMemoryGi?: number;
+  gpu?: number;
+  gpuMemoryGi?: number;
   cpu: number;
   memoryGi: number;
 }
@@ -33,6 +35,7 @@ export interface ModelDef {
     codeRef: string;
     command: string[];
     port: number;
+    weightsPath: string;
     healthPath: string;
     protocol: Protocol;
     models: string[];
@@ -97,6 +100,7 @@ export interface Manifest {
     image: string;
     command: string[];
     port: number;
+    weightsPath?: string;
     protocol: Protocol;
     codeRef?: string;
     healthPath?: string;
@@ -129,6 +133,7 @@ export interface RuntimeInfo {
   codeRef: string;
   command: string[];
   port: number;
+  weightsPath: string;
   healthPath: string;
   protocol: Protocol;
   models: string[];
@@ -179,9 +184,9 @@ export interface EngineForm {
   port: number;
   healthPath: string;
   protocol: Protocol;
-  gpu: number;
-  gpuMemoryGi: number;
+  accelerators: number;
+  acceleratorMemoryGi: number;
   cpu: number;
   memoryGi: number;
-  envText: string;
+  envRows: { key: string; value: string }[];
 }

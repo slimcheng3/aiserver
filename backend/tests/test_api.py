@@ -47,6 +47,7 @@ def test_catalog_has_four_models(tmp_path: Path, monkeypatch) -> None:
     assert models["qwen"]["engine"]["image"] == "local/vllm-engine:latest"
     assert models["qwen"]["engine"]["codeRef"] == "engines/vllm"
     assert models["qwen"]["engine"]["port"] == 8000
+    assert models["qwen"]["engine"]["weightsPath"] == "/weights/checkpoint"
     assert models["qwen"]["engine"]["command"][:2] == ["--model", "/weights/checkpoint"]
     assert "--gpu-memory-utilization" in models["qwen"]["engine"]["command"]
     assert models["sam3"]["engine"]["models"] == ["sam3"]
@@ -85,6 +86,9 @@ def test_local_weight_becomes_package(tmp_path: Path, monkeypatch) -> None:
     assert set(manifest) == {"apiVersion", "kind", "metadata", "model", "engine", "weights"}
     assert manifest["model"] == {"id": "sam3"}
     assert manifest["engine"]["image"] == "local/sam3-engine:latest"
+    assert manifest["engine"]["weightsPath"] == "/weights/checkpoint"
+    assert manifest["engine"]["resources"]["accelerators"] == 1
+    assert manifest["engine"]["resources"]["acceleratorMemoryGi"] == 24
     pkg_id = manifest["metadata"]["id"]
     assert (tmp_path / "packages" / pkg_id / "manifest.json").exists()
 
@@ -299,7 +303,7 @@ def _engine() -> dict:
         "port": 8080,
         "healthPath": "/health",
         "protocol": "http",
-        "resources": {"gpu": 1, "gpuMemoryGi": 24, "cpu": 4, "memoryGi": 32},
+        "resources": {"accelerators": 1, "acceleratorMemoryGi": 24, "cpu": 4, "memoryGi": 32},
         "env": {},
     }
 
@@ -694,6 +698,9 @@ def test_deploy_maps_host_port_and_rejects_s3_weights(tmp_path: Path, monkeypatc
     assert body["endpoint"].startswith("http://127.0.0.1:")
     assert body["pipeline"]
     assert any(args and args[0] == "run" and "-p" in args for args in calls)
+    run_args = next(args for args in calls if args and args[0] == "run")
+    assert any(str(arg).endswith(":/weights/checkpoint:ro") for arg in run_args)
+    assert "WEIGHTS_PATH=/weights/checkpoint" in run_args
 
     registered = client.post("/api/weights/s3", json={"uri": "s3://models/sam3/sam3.pt", "note": ""})
     s3_package = client.post(

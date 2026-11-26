@@ -132,6 +132,14 @@ export function PackageDetailPage({ id }: { id: string }) {
           </button>
         </div>
         <p className="hint">启动命令：{manifest.engine.command.join(" ")}</p>
+        <p className="hint">容器内权重：{manifest.engine.weightsPath || "/weights/checkpoint"}</p>
+        {manifest.engine.resources ? (
+          <p className="hint">
+            资源：加速卡 {manifest.engine.resources.accelerators ?? manifest.engine.resources.gpu ?? 0} ·{" "}
+            {manifest.engine.resources.acceleratorMemoryGi ?? manifest.engine.resources.gpuMemoryGi ?? 0} GiB · CPU{" "}
+            {manifest.engine.resources.cpu} · {manifest.engine.resources.memoryGi} GiB
+          </p>
+        ) : null}
       </section>
       <section className="section">
         <h2 className="section-title">参数</h2>

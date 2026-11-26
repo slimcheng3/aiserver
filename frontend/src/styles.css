@@ -328,6 +328,14 @@ button, input, textarea, select { font: inherit; color: inherit; }
 
 .textarea { min-height: 88px; resize: vertical; }
 
+.env-rows { display: flex; flex-direction: column; gap: 8px; }
+.env-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .readonly-command {
   margin: 0;
   border: 1px solid #31423b;
@@ -574,5 +582,6 @@ button, input, textarea, select { font: inherit; color: inherit; }
   .page-title { font-size: 28px; }
   .grid-models, .facts, .form-grid, .choice-row, .steps { grid-template-columns: 1fr; }
   .res-grid { grid-template-columns: 1fr 1fr; }
+  .env-row { grid-template-columns: 1fr; }
   .span-2 { grid-column: auto; }
 }

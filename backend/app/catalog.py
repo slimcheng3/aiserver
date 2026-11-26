@@ -88,6 +88,7 @@ def _custom_model(model_id: str, runtime: dict) -> ModelDef:
             codeRef=runtime["codeRef"],
             command=list(runtime["command"]),
             port=runtime["port"],
+            weightsPath=str(runtime.get("weightsPath") or "/weights/checkpoint"),
             healthPath=runtime["healthPath"],
             protocol=runtime["protocol"],
             models=list(runtime["models"]),

@@ -22,7 +22,7 @@ models:
       healthPath: /health
       protocol: http
       models: [sam3]
-      weightQuants: [fp16, bf16]
+      weightQuants: [fp16, bf16, int8]
       hardware: nvidia
     resources:
       accelerators: 1

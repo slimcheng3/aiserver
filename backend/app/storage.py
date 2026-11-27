@@ -142,6 +142,21 @@ def _file_asset(
     )
 
 
+def _model_type(path: Path) -> str | None:
+    config = path / "config.json"
+    try:
+        if not config.is_file() or config.stat().st_size > 2_000_000:
+            return None
+        data = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    value = data.get("model_type") if isinstance(data, dict) else None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
 def _dir_asset(
     path: Path,
     *,
@@ -171,6 +186,7 @@ def _dir_asset(
         localPath=str(path.resolve()) if exists else str(path),
         note=note,
         createdAt=_mtime(path),
+        modelType=_model_type(path) if exists and path.is_dir() else None,
     )
 
 

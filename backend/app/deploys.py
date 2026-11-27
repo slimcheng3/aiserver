@@ -10,10 +10,11 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app.config import data_root
+from app.config import data_root, repo_root
 from app import docker_cli
 from app.packaging import get_package
 from app.storage import now_iso
+from app.usage import attach as attach_usage
 
 
 def _dir() -> Path:
@@ -83,6 +84,7 @@ def list_deploys() -> list[dict]:
             continue
         records.append(_sync(record))
     records.sort(key=lambda item: item.get("updatedAt", ""), reverse=True)
+    attach_usage(records)
     return records
 
 
@@ -181,6 +183,14 @@ def _docker_path(path: Path) -> str:
     return path.resolve().as_posix()
 
 
+def _weight_dtype(path: Path) -> str | None:
+    name = path.name.lower()
+    for quant in ("fp16", "bf16", "int8"):
+        if name.endswith(f"-{quant}.pt") or name.endswith(f"-{quant}.pth"):
+            return quant
+    return None
+
+
 def _run_args(
     record: dict,
     mounts: list[tuple[str, str]],
@@ -199,7 +209,7 @@ def _run_args(
         "-e",
         f"WEIGHTS_PATH={container_weights}",
     ]
-    for key, value in record.get("env") or {}.items():
+    for key, value in (record.get("env") or {}).items():
         args.extend(["-e", f"{key}={value}"])
     if int(record.get("accelerators") or record.get("gpu") or 0) > 0:
         args.extend(["--gpus", "all"])
@@ -247,9 +257,16 @@ def deploy(package_id: str, host_port: int | None = None) -> dict:
         "command": [],
         "logs": [f"使用已有镜像 {engine['image']}，不再构建", port_note],
         "accelerators": _accelerator_count(engine),
-        "env": engine.get("env") or {},
+        "env": dict(engine.get("env") or {}),
         "createdAt": now_iso(),
     }
+    dtype = _weight_dtype(Path(mounts[0][0])) if mounts else None
+    if dtype:
+        record["env"]["WEIGHT_DTYPE"] = dtype
+        serve = repo_root() / "engines" / "sam3" / "serve.py"
+        if serve.is_file() and "sam3" in str(engine.get("image") or ""):
+            mounts.append((_docker_path(serve), "/opt/engine/serve.py"))
+            record["logs"].append(f"权重是 {dtype}，加载后按这个精度放进显存")
     if pipeline:
         record["logs"].append(f"权重旁有 pipeline.py，容器里优先使用它：{pipeline}")
     args = _run_args(record, mounts, container_weights, list(engine.get("command") or []))

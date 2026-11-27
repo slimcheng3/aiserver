@@ -4,6 +4,8 @@ import type { MetaInfo } from "./types";
 import { BuildPage } from "./pages/BuildPage";
 import { EnginesPage } from "./pages/EnginesPage";
 import { NewPackagePage } from "./pages/NewPackagePage";
+import { QuantPage } from "./pages/QuantPage";
+import { WeightsPage } from "./pages/WeightsPage";
 import { PackageDetailPage } from "./pages/PackageDetailPage";
 import { PackagesPage } from "./pages/PackagesPage";
 import { RuntimePage } from "./pages/RuntimePage";
@@ -12,6 +14,8 @@ import { TestPage } from "./pages/TestPage";
 type Route =
   | { name: "engines" }
   | { name: "build"; model: string | null; image: string | null }
+  | { name: "weights" }
+  | { name: "quant" }
   | { name: "new"; model: string | null }
   | { name: "packages" }
   | { name: "package"; id: string }
@@ -24,6 +28,8 @@ function parseHash(hash: string): Route {
   const params = new URLSearchParams(query);
   if (path === "/engines") return { name: "engines" };
   if (path === "/build") return { name: "build", model: params.get("model"), image: params.get("image") };
+  if (path === "/weights") return { name: "weights" };
+  if (path === "/quant") return { name: "quant" };
   if (path === "/" || path === "/models" || path === "/new") return { name: "new", model: params.get("model") };
   if (path === "/packages") return { name: "packages" };
   if (path === "/runtime") return { name: "runtime", packageId: params.get("package") };
@@ -48,6 +54,8 @@ export function App() {
     const titles: Record<Route["name"], string> = {
       engines: "运行时",
       build: "构建运行时",
+      weights: "权重",
+      quant: "量化",
       new: "装配",
       packages: "模型包",
       package: "模型包",
@@ -75,6 +83,12 @@ export function App() {
           <a className={route.name === "engines" || route.name === "build" ? "side-link active" : "side-link"} href="#/engines">
             运行时
           </a>
+          <a className={route.name === "weights" ? "side-link active" : "side-link"} href="#/weights">
+            权重
+          </a>
+          <a className={route.name === "quant" ? "side-link active" : "side-link"} href="#/quant">
+            量化
+          </a>
           <a className={route.name === "new" ? "side-link active" : "side-link"} href="#/new">
             装配
           </a>
@@ -96,6 +110,8 @@ export function App() {
       <main>
         {route.name === "engines" && <EnginesPage />}
         {route.name === "build" && <BuildPage modelId={route.model} image={route.image} />}
+        {route.name === "weights" && <WeightsPage />}
+        {route.name === "quant" && <QuantPage />}
         {route.name === "new" && <NewPackagePage initialModel={route.model} />}
         {route.name === "packages" && <PackagesPage />}
         {route.name === "package" && <PackageDetailPage id={route.id} />}

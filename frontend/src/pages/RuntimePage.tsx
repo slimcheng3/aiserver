@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { protocolLabel } from "../format";
-import type { Deployment, ModelDef, PackageView } from "../types";
+import { formatBytes, protocolLabel } from "../format";
+import type { Deployment, ModelDef, PackageView, ResourceUsage } from "../types";
 
 function parseHostPort(raw: string): number | undefined {
   const text = raw.trim();
@@ -101,6 +101,7 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                 <th>镜像</th>
                 <th>协议</th>
                 <th>端口号</th>
+                <th>占用</th>
                 <th></th>
               </tr>
             </thead>
@@ -109,13 +110,16 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                 const id = item.manifest.metadata.id;
                 const current = deploys.find((deploy) => deploy.packageId === id && deploy.status !== "stopped");
                 const blocking = current && (current.status === "running" || current.status === "prepared");
+                const modelName = models.find((model) => model.id === item.manifest.model.id)?.displayName ?? item.manifest.model.id;
                 return (
                   <tr key={id}>
                     <td>
                       <a href={`#/packages/${id}`}>
                         <strong>{item.manifest.metadata.name}</strong>
                       </a>
-                      <div className="hint">{models.find((model) => model.id === item.manifest.model.id)?.displayName ?? item.manifest.model.id}</div>
+                      <div className="hint">
+                        {modelName} · {item.manifest.metadata.version}
+                      </div>
                     </td>
                     <td className="mono">{item.manifest.engine.image}</td>
                     <td>{protocolLabel(item.manifest.engine.protocol)}</td>
@@ -132,6 +136,9 @@ export function RuntimePage({ focus }: { focus: string | null }) {
                           aria-label="端口号，留空自动分配"
                         />
                       )}
+                    </td>
+                    <td>
+                      <UsageLines usage={blocking ? current?.usage : null} pending={current?.status === "running"} />
                     </td>
                     <td>
                       {blocking && current ? (
@@ -185,6 +192,11 @@ function ServicePanel({ service, onStop }: { service: Deployment; onStop: () => 
         本机 · {service.image} · {protocolLabel(service.protocol)}
         {service.pipeline ? " · 使用权重旁的 pipeline.py" : ""}
       </p>
+      {service.status === "running" && (
+        <div className="usage-panel">
+          <UsageLines usage={service.usage} pending />
+        </div>
+      )}
       <dl className="call-list">
         <div>
           <dt>调用入口</dt>
@@ -221,6 +233,17 @@ function ServicePanel({ service, onStop }: { service: Deployment; onStop: () => 
         </a>
       </div>
     </section>
+  );
+}
+
+function UsageLines({ usage, pending }: { usage?: ResourceUsage | null; pending?: boolean }) {
+  if (!usage) return <span className="hint">{pending ? "采集中" : "—"}</span>;
+  return (
+    <div className="usage">
+      <span>显存 {usage.gpuMemoryBytes == null ? "—" : formatBytes(usage.gpuMemoryBytes)}</span>
+      <span>内存 {usage.memoryBytes == null ? "—" : formatBytes(usage.memoryBytes)}</span>
+      <span>CPU {usage.cpuPercent == null ? "—" : `${usage.cpuPercent.toFixed(1)}%`}</span>
+    </div>
   );
 }
 

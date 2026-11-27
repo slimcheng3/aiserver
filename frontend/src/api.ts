@@ -1,4 +1,4 @@
-import type { BuildJob, Deployment, EnvironmentInfo, MetaInfo, ModelDef, PackageView, RuntimeInfo, WeightAsset } from "./types";
+import type { BuildJob, Deployment, EnvironmentInfo, MetaInfo, ModelDef, PackageView, QuantJob, RuntimeInfo, WeightAsset } from "./types";
 
 export function errorMessage(text: string, fallback: string): string {
   try {
@@ -74,6 +74,14 @@ export const api = {
   deleteBase: (image: string) =>
     request<{ ok: boolean }>(`/api/bases?image=${encodeURIComponent(image)}`, { method: "DELETE" }),
   environment: () => request<EnvironmentInfo>("/api/environment"),
+  quants: () => request<QuantJob[]>("/api/quants"),
+  startQuant: (assetId: string, quant: string, calibration = "", image = "") =>
+    request<{ job: QuantJob | null; asset: WeightAsset | null }>("/api/quants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ assetId, quant, calibration, image }),
+    }),
+  quant: (id: string) => request<QuantJob>(`/api/quants/${id}`),
   builds: (image: string) => request<BuildJob[]>(`/api/builds?image=${encodeURIComponent(image)}`),
   startBuild: (image: string, force = false) =>
     request<BuildJob>("/api/builds", {

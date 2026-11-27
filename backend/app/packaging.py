@@ -148,14 +148,14 @@ def create_package(body: PackageCreate) -> PackageView:
         spec = roles[binding.role]
         if spec.quantized:
             if binding.quant is None:
-                raise HTTPException(status_code=400, detail=f"请标明量化类型：{spec.label}")
+                raise HTTPException(status_code=400, detail=f"请标明权重精度：{spec.label}")
             if binding.quant not in supported:
                 raise HTTPException(
                     status_code=400,
                     detail=f"这个运行时不能加载 {binding.quant} 权重",
                 )
         elif binding.quant is not None:
-            raise HTTPException(status_code=400, detail=f"{spec.label} 不标量化类型")
+            raise HTTPException(status_code=400, detail=f"{spec.label} 不标权重精度")
         entry = {"role": binding.role, "path": asset.localPath or asset.uri}
         if binding.quant:
             entry["quant"] = binding.quant

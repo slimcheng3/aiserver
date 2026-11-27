@@ -66,6 +66,9 @@ export function PackageDetailPage({ id }: { id: string }) {
   const interfaces = named?.interfaces ?? manifest.model.interfaces;
   const separator = item.absoluteRoot.includes("\\") ? "\\" : "/";
   const manifestPath = `${item.absoluteRoot}${separator}manifest.json`;
+  const remoteWeight = manifest.weights.some((weight) => weightPath(weight).startsWith("s3://"));
+  const manifestName = `${manifest.metadata.name}.manifest.json`;
+  const archiveName = `${manifest.metadata.name}.zip`;
 
   return (
     <div className="page">
@@ -124,13 +127,29 @@ export function PackageDetailPage({ id }: { id: string }) {
           <button type="button" className="btn" onClick={() => copy(JSON.stringify(manifest, null, 2), "清单")}>
             {copied === "清单" ? "已复制清单" : "复制清单"}
           </button>
-          <a className="btn primary" href={`/api/packages/${id}/manifest`}>
-            下载 manifest
+          <a className="btn primary" href={`/api/packages/${id}/manifest`} download={manifestName}>
+            下载清单
           </a>
+          {remoteWeight ? (
+            <button type="button" className="btn" disabled>
+              下载压缩包
+            </button>
+          ) : (
+            <a className="btn" href={`/api/packages/${id}/archive`} download={archiveName}>
+              下载压缩包
+            </a>
+          )}
           <button type="button" className="btn danger" onClick={() => void remove()}>
             删除包
           </button>
         </div>
+        {remoteWeight ? (
+          <p className="hint">S3 地址不能打进下载包。下载清单得到 {manifestName}，只有清单。</p>
+        ) : (
+          <p className="hint">
+            下载清单得到 {manifestName}，路径是这台机器上的原路径。下载压缩包得到 {archiveName}，包里的 path 改成压缩包内的相对路径。
+          </p>
+        )}
         <p className="hint">启动命令：{manifest.engine.command.join(" ")}</p>
         <p className="hint">容器内权重：{manifest.engine.weightsPath || "/weights/checkpoint"}</p>
         {manifest.engine.resources ? (

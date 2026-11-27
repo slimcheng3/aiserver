@@ -51,7 +51,7 @@ def test_catalog_has_four_models(tmp_path: Path, monkeypatch) -> None:
     assert models["qwen"]["engine"]["command"][:2] == ["--model", "/weights/checkpoint"]
     assert "--gpu-memory-utilization" in models["qwen"]["engine"]["command"]
     assert models["sam3"]["engine"]["models"] == ["sam3"]
-    assert models["sam3"]["engine"]["weightQuants"] == ["fp16", "bf16"]
+    assert models["sam3"]["engine"]["weightQuants"] == ["fp16", "bf16", "int8"]
     assert "awq" in models["qwen"]["engine"]["weightQuants"]
     assert models["genpose2"]["artifacts"][1]["quantized"] is False
 
@@ -99,6 +99,87 @@ def test_local_weight_becomes_package(tmp_path: Path, monkeypatch) -> None:
     removed = client.delete(f"/api/packages/{pkg_id}")
     assert removed.status_code == 200
     assert client.get(f"/api/packages/{pkg_id}").status_code == 404
+
+
+def test_manifest_download_can_include_local_weights(tmp_path: Path, monkeypatch) -> None:
+    library = tmp_path / "library" / "local"
+    library.mkdir(parents=True)
+    (library / "demo.pt").write_bytes(b"file-weight")
+    folder = tmp_path / "hf"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "config.json").write_text('{"model_type": "qwen2"}', encoding="utf-8")
+    (folder / "sub" / "w.bin").write_bytes(b"dir-weight")
+    client = client_with(tmp_path, monkeypatch)
+
+    created = client.post(
+        "/api/packages",
+        json={
+            "modelId": "sam3",
+            "name": "车间分割",
+            "version": "1",
+            "description": "",
+            "weights": [{"role": "checkpoint", "assetId": "local:demo.pt", "quant": "fp16"}],
+            "engine": _engine(),
+        },
+    )
+    pkg_id = created.json()["manifest"]["metadata"]["id"]
+    plain = client.get(f"/api/packages/{pkg_id}/manifest")
+    assert plain.status_code == 200
+    assert plain.headers["content-type"].startswith("application/json")
+    assert plain.content.startswith(b"{")
+    assert json.loads(plain.content)["weights"][0]["path"].endswith("demo.pt")
+    forced = client.get(f"/api/packages/{pkg_id}/manifest", params={"weights": "1"})
+    assert forced.status_code == 200
+    assert forced.headers["content-type"].startswith("application/json")
+    assert forced.content.startswith(b"{")
+
+    bundled = client.get(f"/api/packages/{pkg_id}/archive")
+    assert bundled.status_code == 200
+    assert bundled.headers["content-type"].startswith("application/zip")
+    assert "filename*=UTF-8''" in bundled.headers["content-disposition"]
+    assert bundled.headers["content-disposition"].endswith(".zip")
+    archive = zipfile.ZipFile(io.BytesIO(bundled.content))
+    assert archive.namelist() == ["manifest.json", "weights/checkpoint/demo.pt"]
+    assert archive.read("weights/checkpoint/demo.pt") == b"file-weight"
+    packed_manifest = json.loads(archive.read("manifest.json"))
+    assert packed_manifest["metadata"]["id"] == pkg_id
+    assert packed_manifest["weights"][0]["path"] == "weights/checkpoint/demo.pt"
+    assert packed_manifest["engine"]["weightsPath"] == "/weights/checkpoint"
+    assert json.loads(plain.content)["weights"][0]["path"] != "weights/checkpoint/demo.pt"
+
+    registered = client.post("/api/weights/local-path", json={"path": str(folder), "note": ""})
+    assert registered.json()["modelType"] == "qwen2"
+    directory = client.post(
+        "/api/packages",
+        json={
+            "modelId": "qwen",
+            "name": "qwen-dir",
+            "version": "1",
+            "description": "",
+            "weights": [{"role": "model_dir", "assetId": registered.json()["id"], "quant": "fp16"}],
+            "engine": {**_engine(), "image": "local/vllm-engine:latest", "port": 8000, "protocol": "http"},
+        },
+    )
+    assert directory.status_code == 200
+    packed = client.get(f"/api/packages/{directory.json()['manifest']['metadata']['id']}/archive")
+    packed_archive = zipfile.ZipFile(io.BytesIO(packed.content))
+    assert packed_archive.namelist() == ["manifest.json", "weights/model_dir/config.json", "weights/model_dir/sub/w.bin"]
+    assert json.loads(packed_archive.read("manifest.json"))["weights"][0]["path"] == "weights/model_dir"
+
+    remote = client.post("/api/weights/s3", json={"uri": "s3://models/sam3/sam3.pt", "note": ""})
+    s3_package = client.post(
+        "/api/packages",
+        json={
+            "modelId": "sam3",
+            "name": "s3",
+            "version": "1",
+            "description": "",
+            "weights": [{"role": "checkpoint", "assetId": remote.json()["id"], "quant": "fp16"}],
+            "engine": _engine(),
+        },
+    )
+    refused = client.get(f"/api/packages/{s3_package.json()['manifest']['metadata']['id']}/archive")
+    assert refused.status_code == 400
 
 
 def test_s3_weight_is_referenced_not_downloaded(tmp_path: Path, monkeypatch) -> None:
@@ -788,6 +869,53 @@ def test_deploy_uses_requested_host_port_or_rejects_busy(tmp_path: Path, monkeyp
         busy.close()
 
 
+def test_running_deploy_reports_cpu_memory_and_gpu(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISERVER_USAGE_SYNC", "1")
+    library = tmp_path / "library" / "local"
+    library.mkdir(parents=True)
+    (library / "demo.pt").write_bytes(b"weight")
+    client = client_with(tmp_path, monkeypatch)
+    holder = {"id": ""}
+
+    def run(args, cwd=None):
+        if args[:2] == ["image", "inspect"]:
+            return 0, "ok"
+        if args[:2] == ["rm", "-f"]:
+            return 0, ""
+        if args[:2] == ["inspect", "-f"]:
+            return 0, "true"
+        if args[:1] == ["stats"]:
+            return 0, f"aiserver-{holder['id']}\t12.50%\t1.5GiB / 62.58GiB"
+        if args[:1] == ["top"]:
+            return 0, "PID\n42\n99\n"
+        if args and args[0] == "run":
+            return 0, "cid"
+        return 0, ""
+
+    monkeypatch.setattr("app.docker_cli.run", run)
+    monkeypatch.setattr("app.usage._nvidia", lambda: (0, "42, 2048\n7, 100"))
+    created = client.post(
+        "/api/packages",
+        json={
+            "modelId": "sam3",
+            "name": "占用包",
+            "version": "1",
+            "description": "",
+            "weights": [{"role": "checkpoint", "assetId": "local:demo.pt", "quant": "fp16"}],
+            "engine": _engine(),
+        },
+    )
+    package_id = created.json()["manifest"]["metadata"]["id"]
+    holder["id"] = package_id
+    started = client.post("/api/deploys", json={"packageId": package_id})
+    assert started.status_code == 200
+    listed = client.get("/api/deploys")
+    usage = listed.json()[0]["usage"]
+    assert usage["cpuPercent"] == 12.5
+    assert usage["memoryBytes"] == round(1.5 * 1024**3)
+    assert usage["gpuMemoryBytes"] == 2048 * 1024 * 1024
+
+
 def test_deploy_list_marks_exited_container_failed(tmp_path: Path, monkeypatch) -> None:
     library = tmp_path / "library" / "local"
     library.mkdir(parents=True)
@@ -1091,5 +1219,215 @@ def test_reference_serve_sample_is_accepted(tmp_path: Path, monkeypatch) -> None
     assert created.status_code == 200
     assert created.json()["port"] == 8080
     assert created.json()["healthPath"] == "/health"
+
+
+def test_vllm_fp8_quant_writes_a_new_directory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
+    source = tmp_path / "qwen"
+    source.mkdir()
+    (source / "config.json").write_text('{"model_type": "qwen2"}', encoding="utf-8")
+    runs: list[list[str]] = []
+
+    def run(args, cwd=None):
+        if args[:2] == ["image", "inspect"]:
+            return 0, ""
+        if args and args[0] == "run":
+            runs.append(args)
+            for arg in args:
+                if arg.endswith(":/quantized"):
+                    host = Path(arg.split(":")[0])
+                    host.mkdir(parents=True, exist_ok=True)
+                    (host / "config.json").write_text(
+                        json.dumps({"model_type": "qwen2", "quantization_config": {"quant_method": "compressed-tensors"}}),
+                        encoding="utf-8",
+                    )
+            return 0, "量化完成"
+        return 1, "未预期的 docker 调用"
+
+    patch_docker(monkeypatch, run)
+    client = client_with(tmp_path, monkeypatch)
+    registered = client.post("/api/weights/local-path", json={"path": str(source), "note": ""})
+    assert registered.status_code == 200
+
+    refused = client.post("/api/quants", json={"assetId": registered.json()["id"], "quant": "int8"})
+    assert refused.status_code == 400
+
+    created = client.post("/api/quants", json={"assetId": registered.json()["id"], "quant": "fp8"})
+    assert created.status_code == 200
+    body = created.json()
+    assert body["job"]["status"] == "ready"
+    assert runs[0][runs[0].index("--entrypoint") + 1] == "python3"
+    assert "QUANT=fp8" in runs[0]
+    assert not any(str(arg).startswith("CALIBRATION_PATH=") for arg in runs[0])
+    assert body["asset"]["name"] == "qwen-fp8"
+    assert body["asset"]["localPath"].endswith("/qwen-fp8")
+    listed = client.get("/api/quants")
+    assert listed.status_code == 200
+    assert [row["id"] for row in listed.json()] == [body["job"]["id"]]
+    assert json.loads(Path(body["asset"]["localPath"], "config.json").read_text(encoding="utf-8"))["quantization_config"]
+    assert len(runs) == 1
+
+    again = client.post("/api/quants", json={"assetId": registered.json()["id"], "quant": "fp8"})
+    assert again.status_code == 200
+    assert again.json()["job"] is None
+    assert again.json()["asset"]["id"] == body["asset"]["id"]
+    assert len(runs) == 1
+
+
+def test_awq_and_gptq_quant_pass_calibration_text(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
+    source = tmp_path / "qwen"
+    source.mkdir()
+    (source / "config.json").write_text('{"model_type": "qwen2"}', encoding="utf-8")
+    runs: list[list[str]] = []
+    samples = "\n".join(f"第 {index} 条校准文本，用来看激活。" for index in range(8))
+
+    def run(args, cwd=None):
+        if args[:2] == ["image", "inspect"]:
+            return 0, ""
+        if args and args[0] == "run":
+            runs.append(args)
+            for arg in args:
+                if arg.endswith(":/quantized"):
+                    host = Path(arg.split(":")[0])
+                    host.mkdir(parents=True, exist_ok=True)
+                    (host / "config.json").write_text(
+                        json.dumps({"model_type": "qwen2", "quantization_config": {"quant_method": "compressed-tensors"}}),
+                        encoding="utf-8",
+                    )
+            return 0, "量化完成"
+        return 1, "未预期的 docker 调用"
+
+    patch_docker(monkeypatch, run)
+    client = client_with(tmp_path, monkeypatch)
+    registered = client.post("/api/weights/local-path", json={"path": str(source), "note": ""})
+    asset_id = registered.json()["id"]
+    short = client.post("/api/quants", json={"assetId": asset_id, "quant": "awq", "calibration": "只有一条"})
+    assert short.status_code == 400
+
+    created = client.post("/api/quants", json={"assetId": asset_id, "quant": "awq", "calibration": samples})
+    assert created.status_code == 200
+    body = created.json()
+    assert body["job"]["status"] == "ready"
+    assert body["asset"]["name"] == "qwen-awq"
+    assert body["asset"]["note"].startswith("awq 量化自 ")
+    assert "QUANT=awq" in runs[0]
+    mounted = next(arg for arg in runs[0] if arg.endswith(":/opt/aiserver/calibration:ro"))
+    payload = json.loads((Path(mounted.split(":")[0]) / "train.json").read_text(encoding="utf-8"))
+    assert len(payload) == 8
+    assert payload[0]["text"].startswith("第 0 条")
+
+    gptq = client.post("/api/quants", json={"assetId": asset_id, "quant": "gptq"})
+    assert gptq.status_code == 200
+    assert gptq.json()["asset"]["name"] == "qwen-gptq"
+    assert "QUANT=gptq" in runs[1]
+    builtin = next(arg for arg in runs[1] if arg.endswith(":/opt/aiserver/calibration:ro"))
+    rows = json.loads((Path(builtin.split(":")[0]) / "train.json").read_text(encoding="utf-8"))
+    assert len(rows) >= 8
+    assert "使用内置校准文本" in gptq.json()["job"]["logs"][0]
+
+
+def test_sam3_quant_writes_a_checkpoint_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISERVER_BUILD_SYNC", "1")
+    source = tmp_path / "sam3.pt"
+    source.write_bytes(b"checkpoint")
+    runs: list[list[str]] = []
+
+    def run(args, cwd=None):
+        if args[:2] == ["image", "inspect"]:
+            return 0, ""
+        if args and args[0] == "run":
+            runs.append(args)
+            for arg in args:
+                if arg.endswith(":/quantized"):
+                    host = Path(arg.split(":")[0])
+                    host.mkdir(parents=True, exist_ok=True)
+                    (host / "checkpoint.pt").write_bytes(b"fp16")
+            return 0, "量化完成"
+        return 1, "未预期的 docker 调用"
+
+    patch_docker(monkeypatch, run)
+    client = client_with(tmp_path, monkeypatch)
+    registered = client.post("/api/weights/local-path", json={"path": str(source), "note": ""})
+    asset_id = registered.json()["id"]
+    folder = tmp_path / "qwen-dir"
+    folder.mkdir()
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    directory = client.post("/api/weights/local-path", json={"path": str(folder), "note": ""})
+    refused = client.post(
+        "/api/quants",
+        json={"assetId": directory.json()["id"], "quant": "fp16", "image": "local/sam3-engine:latest"},
+    )
+    assert refused.status_code == 400
+
+    created = client.post(
+        "/api/quants",
+        json={"assetId": asset_id, "quant": "fp16", "image": "local/sam3-engine:latest"},
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["job"]["status"] == "ready"
+    assert body["asset"]["kind"] == "file"
+    assert body["asset"]["name"] == "sam3-fp16.pt"
+    assert body["asset"]["note"].startswith("fp16 量化自 ")
+    assert "QUANT=fp16" in runs[0]
+    assert "--gpus" not in runs[0]
+    assert Path(body["asset"]["localPath"]).read_bytes() == b"fp16"
+
+    again = client.post(
+        "/api/quants",
+        json={"assetId": asset_id, "quant": "fp16", "image": "local/sam3-engine:latest"},
+    )
+    assert again.json()["job"] is None
+    assert again.json()["asset"]["id"] == body["asset"]["id"]
+    assert len(runs) == 1
+
+    int8 = client.post(
+        "/api/quants",
+        json={"assetId": asset_id, "quant": "int8", "image": "local/sam3-engine:latest"},
+    )
+    assert int8.status_code == 200
+    assert int8.json()["asset"]["name"] == "sam3-int8.pt"
+    assert "QUANT=int8" in runs[1]
+
+
+def test_deploy_quantized_sam3_keeps_weight_dtype(tmp_path: Path, monkeypatch) -> None:
+    weight = tmp_path / "outside" / "sam3-fp16.pt"
+    weight.parent.mkdir()
+    weight.write_bytes(b"fp16")
+    calls: list[list[str]] = []
+
+    def run(args, cwd=None):
+        calls.append(list(args))
+        if args[:2] == ["image", "inspect"]:
+            return 0, "ok"
+        if args[:2] == ["rm", "-f"]:
+            return 0, ""
+        if args[:2] == ["inspect", "-f"]:
+            return 0, "true"
+        if args and args[0] == "run":
+            return 0, "cid"
+        return 0, ""
+
+    patch_docker(monkeypatch, run)
+    client = client_with(tmp_path, monkeypatch)
+    registered = client.post("/api/weights/local-path", json={"path": str(weight), "note": "fp16 量化自 /tmp/sam3.pt"})
+    created = client.post(
+        "/api/packages",
+        json={
+            "modelId": "sam3",
+            "name": "sam3-fp16",
+            "version": "1",
+            "description": "",
+            "weights": [{"role": "checkpoint", "assetId": registered.json()["id"], "quant": "fp16"}],
+            "engine": _engine(),
+        },
+    )
+    assert created.status_code == 200
+    started = client.post("/api/deploys", json={"packageId": created.json()["manifest"]["metadata"]["id"]})
+    assert started.status_code == 200
+    run_args = next(args for args in calls if args and args[0] == "run")
+    assert "WEIGHT_DTYPE=fp16" in run_args
+    assert any(arg.endswith(":/opt/engine/serve.py:ro") for arg in run_args)
 
 

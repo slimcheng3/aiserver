@@ -66,6 +66,7 @@ export interface WeightAsset {
   key: string | null;
   note: string | null;
   createdAt: string | null;
+  modelType: string | null;
 }
 
 export interface WeightEntry {
@@ -143,6 +144,19 @@ export interface RuntimeInfo {
   createdAt: string;
 }
 
+export interface QuantJob {
+  id: string;
+  assetId: string;
+  quant: string;
+  image?: string;
+  source?: string;
+  output?: string;
+  status: "queued" | "running" | "ready" | "failed";
+  logs: string[];
+  resultAssetId: string | null;
+  createdAt?: string;
+}
+
 export interface BuildJob {
   id: string;
   image: string;
@@ -151,6 +165,12 @@ export interface BuildJob {
   logs: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ResourceUsage {
+  cpuPercent: number | null;
+  memoryBytes: number | null;
+  gpuMemoryBytes: number | null;
 }
 
 export interface Deployment {
@@ -166,6 +186,7 @@ export interface Deployment {
   pipeline: string | null;
   command: string[];
   logs: string[];
+  usage?: ResourceUsage | null;
 }
 
 export interface EnvironmentInfo {

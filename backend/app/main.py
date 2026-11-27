@@ -5,6 +5,8 @@ import queue
 import threading
 import zipfile
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,9 @@ from app.config import catalog_path, data_root, repo_root
 from app.deploys import call_chat, call_infer, deploy, list_deploys, probe, stop
 from app.environment import environment
 from app.packaging import create_package, delete_package, get_package, list_packages
+from app.quantize import get_job as get_quant_job
+from app.quantize import list_jobs as list_quant_jobs
+from app.quantize import start_quant
 from app.runtimes import (
     create_user_runtime,
     delete_base,
@@ -36,6 +41,7 @@ from app.schemas import (
     ModelDef,
     PackageCreate,
     PackageView,
+    QuantRequest,
     S3Register,
     S3Verify,
     S3VerifyResult,
@@ -148,12 +154,135 @@ def package_detail(pkg_id: str) -> PackageView:
     return get_package(pkg_id)
 
 
+def _role_folder(role: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in role).strip("._") or "weight"
+
+
+def _zip_weight_path(role: str, path: Path) -> str:
+    folder = _role_folder(role)
+    if path.is_file():
+        return f"weights/{folder}/{path.name}"
+    return f"weights/{folder}"
+
+
+def _weight_files(manifest: dict) -> list[tuple[Path, str]]:
+    files: list[tuple[Path, str]] = []
+    for weight in manifest.get("weights") or []:
+        raw = str(weight.get("path") or weight.get("localPath") or weight.get("uri") or "")
+        role = str(weight.get("role") or "weight")
+        if not raw or raw.startswith("s3://"):
+            raise HTTPException(status_code=400, detail="S3 地址不能打进下载包，请用本机路径")
+        path = Path(raw)
+        if not path.exists():
+            raise HTTPException(status_code=400, detail=f"本机路径不存在：{path}")
+        if path.is_file():
+            files.append((path, _zip_weight_path(role, path)))
+            continue
+        folder = _role_folder(role)
+        found = False
+        for child in sorted(path.rglob("*")):
+            if not child.is_file():
+                continue
+            found = True
+            files.append((child, f"weights/{folder}/{child.relative_to(path).as_posix()}"))
+        if not found:
+            raise HTTPException(status_code=400, detail=f"权重目录里没有文件：{path}")
+    if not files:
+        raise HTTPException(status_code=400, detail="这份模型包没有可下载的本机权重")
+    return files
+
+
+def _archive_manifest(manifest: dict) -> bytes:
+    """压缩包里的 path 改成包内相对路径。磁盘上的清单仍保留本机原路径。"""
+    packed = json.loads(json.dumps(manifest))
+    for weight in packed.get("weights") or []:
+        raw = str(weight.get("path") or weight.get("localPath") or weight.get("uri") or "")
+        role = str(weight.get("role") or "weight")
+        path = Path(raw)
+        weight.pop("localPath", None)
+        weight.pop("uri", None)
+        weight["path"] = _zip_weight_path(role, path)
+    return (json.dumps(packed, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _export_package(document: bytes, files: list[tuple[Path, str]]) -> Iterator[bytes]:
+    """压缩包里放 manifest.json 和本机权重。权重大文件按块写入，不先收齐整包。"""
+    stop = threading.Event()
+    chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
+    failed: list[BaseException] = []
+
+    class _Writer:
+        def write(self, data: bytes) -> int:
+            if stop.is_set():
+                raise RuntimeError("下载已取消")
+            chunks.put(data)
+            return len(data)
+
+        def seekable(self) -> bool:
+            return False
+
+        def flush(self) -> None:
+            return None
+
+    def produce() -> None:
+        try:
+            with zipfile.ZipFile(_Writer(), "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                archive.writestr("manifest.json", document)
+                for source, member in files:
+                    with archive.open(member, "w", force_zip64=True) as dest, source.open("rb") as handle:
+                        while True:
+                            if stop.is_set():
+                                raise RuntimeError("下载已取消")
+                            block = handle.read(1024 * 1024)
+                            if not block:
+                                break
+                            dest.write(block)
+        except Exception as exc:
+            failed.append(exc)
+        finally:
+            chunks.put(None)
+
+    threading.Thread(target=produce, daemon=True).start()
+    try:
+        while True:
+            piece = chunks.get()
+            if piece is None:
+                break
+            yield piece
+    finally:
+        stop.set()
+    if failed:
+        raise failed[0]
+
+
 @app.get("/api/packages/{pkg_id}/manifest")
-def download_manifest(pkg_id: str) -> FileResponse:
+def download_manifest(pkg_id: str):
+    """只返回清单 JSON。权重在另一个地址，避免同一条链接有时是压缩包。"""
     view = get_package(pkg_id)
     name = view.manifest.get("metadata", {}).get("name", pkg_id)
     path = data_root() / "packages" / pkg_id / "manifest.json"
-    return FileResponse(path, media_type="application/json", filename=f"{name}.manifest.json")
+    return FileResponse(
+        path,
+        media_type="application/json",
+        filename=f"{name}.manifest.json",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/api/packages/{pkg_id}/archive")
+def download_archive(pkg_id: str):
+    view = get_package(pkg_id)
+    name = view.manifest.get("metadata", {}).get("name", pkg_id)
+    files = _weight_files(view.manifest)
+    document = _archive_manifest(view.manifest)
+    filename = f"{name}.zip"
+    ascii_name = "".join(ch if ch.isascii() and (ch.isalnum() or ch in "-._") else "_" for ch in filename).strip("._") or "package.zip"
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    return StreamingResponse(
+        _export_package(document, files),
+        media_type="application/zip",
+        headers={"Content-Disposition": disposition, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.delete("/api/packages/{pkg_id}")
@@ -273,6 +402,23 @@ def download_runtime_tar(image: str) -> StreamingResponse:
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/quants")
+def quants() -> list[dict]:
+    return list_quant_jobs()
+
+
+@app.post("/api/quants")
+def add_quant(body: QuantRequest) -> dict:
+    result = start_quant(body.assetId, body.quant, body.calibration, body.image)
+    asset = result["asset"]
+    return {"job": result["job"], "asset": None if asset is None else asset.model_dump()}
+
+
+@app.get("/api/quants/{job_id}")
+def quant_job(job_id: str) -> dict:
+    return get_quant_job(job_id)
 
 
 @app.get("/api/builds")

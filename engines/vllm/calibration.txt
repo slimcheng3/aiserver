@@ -1,0 +1,62 @@
+今天天气不错，适合出门散步，顺便把明天的会议提纲过一遍。
+请把下面这段话翻译成英文，并保持原来的语气。
+解释一下什么是分组量化，以及它和按张量量化的差别。
+用三句话介绍上海的地铁，适合写给第一次来的人。
+计算 128 乘 64，再说明这个数字在 4 bit 分组里代表多少组。
+写一封简短的邮件，告诉同事模型目录已经准备好，可以开始测试。
+描述一张厨房的照片：灶台、窗户、一把刀和一碗切好的番茄。
+把「请在周五前交报告」改得更礼貌一些。
+列出五个常见的水果，并为每个写一句用途。
+如果显存只剩 8 GB，加载 1.5B 模型时应该注意什么？
+Explain how a tokenizer splits an unknown word into smaller pieces.
+Write a short story about a robot learning to pour tea without spilling.
+Summarize the difference between weight-only quantization and quantizing activations.
+Give three reasons a calibration sentence should sound like real user input.
+Convert these steps into a checklist: open the file, read the header, close the handle.
+A customer asks for a refund because the package arrived late. Reply in two sentences.
+Describe the sound of rain on a metal roof, then on a quiet library window.
+What does group size 128 mean when storing 4-bit weights?
+Translate this into Chinese: The service is running and the port is open.
+Write a function comment for a helper that joins two paths and rejects parent directories.
+清晨的菜市场里，鱼摊旁边是卖豆腐的，空气里有一点海腥味。
+请把这段会议记录收成三条行动项，不要加入原文里没有的决定。
+一个小朋友问月亮为什么跟着车走，用他听得懂的话回答。
+比较骑自行车和坐公交去公司的时间、费用和出门需要准备的东西。
+把 3.5 小时换算成分钟，并说明中途休息 10 分钟后还剩多少。
+写一段产品说明，对象是会插电源、不会看日志的用户。
+描述如何把一张桌子从客厅搬到阳台，注意门的宽度。
+用简洁的句子解释缓存：同样的问题第二次为什么更快。
+给出一道只需要加法的应用题，并写出答案。
+如果用户只说「你好」，模型应该怎样接话才不会跑题？
+The train leaves at 18:40 and the station is a twelve-minute walk from the office.
+List the tools you would pack to fix a loose chair leg at home.
+Rewrite this alarm in a calm voice: disk space is below five percent.
+Explain to a new teammate where to put a model directory on this machine.
+A recipe needs soy sauce, ginger, and garlic. Describe the smell while it cooks.
+What is the next number in this sequence: 2, 4, 8, 16? Say why.
+Draft a two-line commit message for a change that only updates a label.
+Describe a quiet street at night, including one sound and one light.
+How would you check that a downloaded file was not cut off halfway?
+请用普通话解释「回车」和「换行」是不是一回事。
+把「这个结果不对」展开成一段可以复查的说明，包含输入和期望。
+一个游客想从机场到酒店，给三条可执行的路线建议。
+写四句关于冬天早晨的话，每句都包含一个具体物件。
+说明为什么同一段话重复很多遍，不如换成不同主题的短句。
+把下列词连成一段通顺的话：窗口、蓝图、铅笔、下午。
+描述一次失败的蛋糕：表面塌了，但味道还能接受。
+给客服写一句确认语，表示已经收到订单号和照片。
+用英语问三个关于周末计划的问题，句子要短。
+Explain why a scale factor can keep a salient channel from collapsing to zero.
+Write a packing list for a one-day hike when the forecast says light rain.
+A log line says connection refused. Give the first two checks to try.
+Describe the layout of a small desk: laptop, cup, notebook, and a lamp.
+Turn this request into steps: resize the image, then save a copy, then close the editor.
+What should a health check return when the process is up but still loading weights?
+请把「大概、可能、也许」从这段话里拿掉，改成可以直接执行的说法。
+介绍一种不会占用双手的听新闻方式，适合通勤。
+写一段对话，甲方只说「再快一点」，乙方追问快的是哪一步。
+计算一把椅子四条腿，三把椅子一共多少条腿，并用一句话写出算式。
+描述图书馆闭馆前十分钟，人们各自在做什么。
+把一句很长的要求拆成编号列表，主题是准备一场一小时的分享。
+如果校准文本全是同一句话，量化后的模型会更熟悉哪类说法？
+用两句话说明文件路径和容器内挂载路径不是同一个字符串。

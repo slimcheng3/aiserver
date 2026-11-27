@@ -326,6 +326,24 @@ button, input, textarea, select { font: inherit; color: inherit; }
   padding: 6px 8px;
 }
 
+.usage {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.usage-panel {
+  margin: 8px 0 4px;
+}
+
+.usage-panel .usage {
+  flex-direction: row;
+  gap: 18px;
+}
+
 .textarea { min-height: 88px; resize: vertical; }
 
 .env-rows { display: flex; flex-direction: column; gap: 8px; }

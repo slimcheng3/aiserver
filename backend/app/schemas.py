@@ -117,6 +117,7 @@ class WeightAsset(BaseModel):
     key: str | None = None
     note: str | None = None
     createdAt: str | None = None
+    modelType: str | None = None
 
 
 class S3Register(BaseModel):
@@ -220,6 +221,20 @@ class PackageCreate(BaseModel):
 class PackageView(BaseModel):
     absoluteRoot: str
     manifest: dict
+
+
+class QuantRequest(BaseModel):
+    assetId: str
+    quant: str = "fp8"
+    calibration: str = ""
+    image: str = ""
+
+    @field_validator("calibration")
+    @classmethod
+    def calibration_ok(cls, value: str) -> str:
+        if len(value) > 200_000:
+            raise ValueError("校准文本不能超过 20 万字")
+        return value
 
 
 class BuildRequest(BaseModel):
